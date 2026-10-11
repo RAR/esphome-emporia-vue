@@ -31,13 +31,18 @@ inline float power_factor(float watts, float va, float min_va = MIN_POWER_FACTOR
 struct StepConfig {
   float min_step_w = 30.0f;    // a step must move at least this far...
   float rel_step = 0.02f;      // ...and this fraction of the smaller of the two levels...
-  float noise_factor = 4.0f;   // ...and this many times the level's usual wobble
+  float noise_factor = 4.0f;   // ...and this many times the level's usual wobble...
+  float max_noise_w = 0.0f;    // ...held to this if set (never under 1.5x the wobble); 0 no cap
   float settle_w = 10.0f;      // settled once the last frames span no more than this...
   float settle_rel = 0.03f;    // ...or this fraction of their level, or twice the wobble
   uint8_t confirm = 2;         // frames away from the level before it counts as a step
   uint8_t settle_frames = 4;   // frames that must agree to call it settled (at most 8)
   uint32_t timeout_ms = 10000; // a step that has not settled by then is reported as is
   float min_va = MIN_POWER_FACTOR_VA;  // power factor is unknown below this (per clamp, summed for a circuit)
+  // A change too gradual or too jittery to make a step (a load fading off, or switching off on a circuit
+  // whose wobble hides it) is reported once a slow average has stayed a step away from the level the
+  // last event left for this many frames; 0 never.
+  uint8_t drift_frames = 20;
 };
 
 struct LoadEvent {
@@ -52,6 +57,7 @@ struct LoadEvent {
   uint32_t settle_ms{0};           // from start_ms to the first of the settled frames
   bool settled{false};             // false when it timed out still moving
   bool pulse{false};               // it came back to where it was: an inrush or a brief load
+  bool drift{false};               // a gradual change, not a step: from and to are slow averages
   uint32_t first_ms{0}, last_ms{0};  // the first and last stored samples
   uint32_t reported_ms{0};           // when it was handed on (set by the component)
   uint8_t count{0};
@@ -93,8 +99,8 @@ struct LoadEvent {
     num("pf_from", this->pf_from(), "%.2f");
     num("pf_to", this->pf_to(), "%.2f");
     num("noise_w", this->noise_w, "%.1f");
-    snprintf(buf, sizeof(buf), ",\"settle_ms\":%u,\"settled\":%s,\"pulse\":%s", (unsigned) this->settle_ms,
-             this->settled ? "true" : "false", this->pulse ? "true" : "false");
+    snprintf(buf, sizeof(buf), ",\"settle_ms\":%u,\"settled\":%s,\"pulse\":%s,\"drift\":%s", (unsigned) this->settle_ms,
+             this->settled ? "true" : "false", this->pulse ? "true" : "false", this->drift ? "true" : "false");
     out += buf;
     unsigned dt = this->count > 1 ? (unsigned) ((this->last_ms - this->first_ms) / (this->count - 1)) : 0;
     snprintf(buf, sizeof(buf), ",\"dt_ms\":%u,\"samples\":[", dt);
@@ -112,6 +118,8 @@ class StepDetector {
  public:
   static constexpr uint8_t PRE = 3;     // steady frames kept to lead into a step
   static constexpr uint8_t WINDOW = 8;  // the most frames the settle check looks back over
+  static constexpr float DRIFT_GAIN = 0.1f;      // the slow average's weight on each frame (~10 frames)
+  static constexpr float ANCHOR_GAIN = 1 / 600.0f;  // the anchor follows change slower than ~600 frames (5 min)
 
   explicit StepDetector(const char *key = "", StepConfig cfg = {}) : cfg_(cfg) {
     this->event_.key = key;
@@ -134,9 +142,13 @@ class StepDetector {
       this->primed_ = true;
       this->base_ = w;
       this->base_va_ = va;
+      this->anchor(w, va);
       this->remember(w, va, ms);
       return false;
     }
+    this->slow_ += DRIFT_GAIN * (w - this->slow_);
+    if (!std::isnan(va))
+      this->slow_va_ = std::isnan(this->slow_va_) ? va : this->slow_va_ + DRIFT_GAIN * (va - this->slow_va_);
     if (!this->moving_) {
       float off = std::fabs(w - this->base_);
       if (off <= this->threshold(this->base_, w)) {
@@ -147,7 +159,7 @@ class StepDetector {
         if (!std::isnan(va))
           this->base_va_ = std::isnan(this->base_va_) ? va : this->base_va_ + 0.25f * (va - this->base_va_);
         this->remember(w, va, ms);
-        return false;
+        return this->drifted(ms);
       }
       // Away from the level: wait for `confirm` frames in a row before calling it a step.
       this->pend_w_[this->pending_] = w;
@@ -167,7 +179,83 @@ class StepDetector {
   // switching on and the same load switching off are both seen.
   float threshold(float level, float w) const {
     float smaller = std::min(std::fabs(level), std::fabs(w));
-    return std::max({this->cfg_.min_step_w, this->cfg_.rel_step * smaller, this->cfg_.noise_factor * this->noise_});
+    // The wobble's part is capped so a jittery level does not hide a load the size of the cap switching,
+    // but stays past the wobble itself, so the jitter is never a step.
+    float wobble = this->cfg_.noise_factor * this->noise_;
+    if (this->cfg_.max_noise_w > 0)
+      wobble = std::min(wobble, std::max(this->cfg_.max_noise_w, 1.5f * this->noise_));
+    return std::max({this->cfg_.min_step_w, this->cfg_.rel_step * smaller, wobble});
+  }
+  // What a slow average must move to be reported: twice a step by the level alone, without the wobble,
+  // so steady creep the anchor lags behind does not come out as a stream of minimum-sized changes.
+  float drift_threshold(float level, float w) const {
+    return 2.0f * std::max(this->cfg_.min_step_w, this->cfg_.rel_step * std::min(std::fabs(level), std::fabs(w)));
+  }
+
+  // The level an event left: where gradual change is measured from.
+  void anchor(float w, float va) {
+    this->anchor_w_ = w;
+    this->anchor_va_ = va;
+    this->slow_ = w;
+    this->slow_va_ = va;
+    this->drift_n_ = 0;
+  }
+
+  // True when the slow average has stayed a step away from the anchor for drift_frames: reported as an
+  // event from the anchor to the slow average, dated from when it first moved away.
+  bool drifted(uint32_t ms) {
+    if (this->cfg_.drift_frames == 0)
+      return false;
+    float gap = std::fabs(this->slow_ - this->anchor_w_), limit = this->drift_threshold(this->anchor_w_, this->slow_);
+    if (gap <= limit) {
+      // Change over many minutes (a heater sagging as it warms) is not a load switching: followed while
+      // within a step, but not once a change is under way, which is measured from where it began.
+      if (gap <= limit / 2)
+        this->anchor_w_ += ANCHOR_GAIN * (this->slow_ - this->anchor_w_);
+      if (gap <= limit / 2 && !std::isnan(this->slow_va_))
+        this->anchor_va_ = std::isnan(this->anchor_va_) ? this->slow_va_ : this->anchor_va_ + ANCHOR_GAIN * (this->slow_va_ - this->anchor_va_);
+      this->drift_n_ = 0;
+      return false;
+    }
+    if (this->drift_n_++ == 0) {
+      this->drift_ms_ = ms;
+      this->drift_mid_ = this->slow_;
+    }
+    if (this->drift_n_ < this->cfg_.drift_frames)
+      return false;
+    // Still on its way (a fade not finished): wait for it to stop, up to six timeouts, so it is one
+    // event. Stopped is moving less than a quarter of a step over the last drift_frames.
+    float still = this->drift_threshold(this->anchor_w_, this->slow_) / 4.0f;
+    if (std::fabs(this->slow_ - this->drift_mid_) > still && ms - this->drift_ms_ < 6 * this->cfg_.timeout_ms) {
+      this->drift_n_ = 1;
+      this->drift_mid_ = this->slow_;
+      return false;
+    }
+    LoadEvent &e = this->event_;
+    e.from_w = this->anchor_w_;
+    e.va_from = this->anchor_va_;
+    e.to_w = this->slow_;
+    e.va_to = this->slow_va_;
+    e.peak_w = this->slow_;
+    e.noise_w = this->noise_;
+    e.start_ms = this->drift_ms_;
+    e.settle_ms = ms - this->drift_ms_;
+    e.settled = false;
+    e.pulse = false;
+    e.drift = true;
+    e.count = 0;
+    for (uint8_t i = 0; i < this->pre_n_; i++) {
+      uint8_t at = (this->pre_head_ + PRE - this->pre_n_ + i) % PRE;
+      if (i == 0)
+        e.first_ms = this->pre_ms_[at];
+      e.samples[e.count++] = this->pre_w_[at];
+      e.last_ms = this->pre_ms_[at];
+    }
+    this->base_ = this->slow_;
+    if (!std::isnan(this->slow_va_))
+      this->base_va_ = this->slow_va_;
+    this->anchor(this->slow_, this->slow_va_);
+    return true;
   }
   float tolerance(float level) const {
     return std::max({this->cfg_.settle_w, this->cfg_.settle_rel * std::fabs(level), 2.0f * this->noise_});
@@ -188,6 +276,7 @@ class StepDetector {
     e.noise_w = this->noise_;
     e.peak_w = this->base_;
     e.start_ms = this->pend_ms_[0];
+    e.drift = false;
     e.count = 0;
     for (uint8_t i = 0; i < this->pre_n_; i++) {
       uint8_t at = (this->pre_head_ + PRE - this->pre_n_ + i) % PRE;
@@ -220,6 +309,20 @@ class StepDetector {
     this->win_ms_[at] = ms;
     this->win_head_ = (at + 1) % WINDOW;
     this->win_n_ = std::min<uint8_t>(this->win_n_ + 1, WINDOW);
+  }
+
+  // How many times the last `n` captured frames turned back (rising then falling, or the reverse).
+  uint8_t turns(uint8_t n) const {
+    uint8_t count = 0;
+    float last = 0;
+    for (uint8_t i = 1; i < n; i++) {
+      float d = this->win_w_[this->recent(i, n)] - this->win_w_[this->recent(i - 1, n)];
+      if (d != 0 && last != 0 && (d > 0) != (last > 0))
+        count++;
+      if (d != 0)
+        last = d;
+    }
+    return count;
   }
 
   // The last `n` captured frames, oldest first.
@@ -257,9 +360,12 @@ class StepDetector {
     this->base_ = mean;
     if (va_n)
       this->base_va_ = e.va_to;
+    this->anchor(mean, this->base_va_);
     // A level that never settled wobbles at least this much: an oscillating
     // load would otherwise fire a timed-out event every timeout.
-    if (!settled)
+    // A ramp (an EV charger stepping up) times out too, but is not wobble: learning it would make
+    // every later stretch of the ramp a "settled" step. Wobble turns back and forth.
+    if (!settled && this->turns(this->win_n_) >= 2)
       this->noise_ = std::max(this->noise_, (hi - lo) / 2.0f);
     this->pre_n_ = 0;
     this->pre_head_ = 0;
@@ -278,6 +384,11 @@ class StepDetector {
   float base_{0};
   float base_va_{NAN};
   float noise_{0};
+  float slow_{0}, slow_va_{NAN};          // the slow average of every frame
+  float anchor_w_{0}, anchor_va_{NAN};    // the level the last event left
+  uint8_t drift_n_{0};                    // frames the slow average has been a step away from it
+  uint32_t drift_ms_{0};                  // when it first was
+  float drift_mid_{0};                    // the slow average drift_frames ago, to see it has stopped moving
   uint8_t pending_{0};
   float pend_w_[WINDOW]{}, pend_va_[WINDOW]{};
   uint32_t pend_ms_[WINDOW]{};

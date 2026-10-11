@@ -58,6 +58,8 @@ CONF_SETTLE_WITHIN = "settle_within"
 CONF_SETTLE_WITHIN_PERCENT = "settle_within_percent"
 CONF_CONFIRM_FRAMES = "confirm_frames"
 CONF_SETTLE_FRAMES = "settle_frames"
+CONF_MAX_NOISE = "max_noise"
+CONF_DRIFT_FRAMES = "drift_frames"
 CONF_TIMEOUT = "timeout"
 
 CODEOWNERS = ["@flaviut", "@Maelstrom96", "@krconv"]
@@ -174,6 +176,10 @@ SCHEMA_STEP_DETECTION = cv.Schema(
         cv.Optional(CONF_MIN_STEP, default="30W"): watts,
         cv.Optional(CONF_MIN_STEP_PERCENT, default="2%"): cv.percentage,
         cv.Optional(CONF_NOISE_FACTOR, default=4.0): cv.float_range(min=0, max=20),
+        # The wobble's part of the threshold is held to this if set (never under 1.5x the wobble); 0W no cap.
+        cv.Optional(CONF_MAX_NOISE, default="0W"): watts,
+        # Frames a gradual change must hold before it is reported (about 10 s on a Vue 3); 0 never.
+        cv.Optional(CONF_DRIFT_FRAMES, default=20): cv.int_range(min=0, max=120),
         cv.Optional(CONF_SETTLE_WITHIN, default="10W"): watts,
         cv.Optional(CONF_SETTLE_WITHIN_PERCENT, default="3%"): cv.percentage,
         cv.Optional(CONF_CONFIRM_FRAMES, default=2): cv.int_range(min=1, max=8),
@@ -408,11 +414,13 @@ async def to_code(config):
         ("min_step_w", events[CONF_MIN_STEP]),
         ("rel_step", events[CONF_MIN_STEP_PERCENT]),
         ("noise_factor", events[CONF_NOISE_FACTOR]),
+        ("max_noise_w", events[CONF_MAX_NOISE]),
         ("settle_w", events[CONF_SETTLE_WITHIN]),
         ("settle_rel", events[CONF_SETTLE_WITHIN_PERCENT]),
         ("confirm", events[CONF_CONFIRM_FRAMES]),
         ("settle_frames", events[CONF_SETTLE_FRAMES]),
         ("timeout_ms", events[CONF_TIMEOUT].total_milliseconds),
+        ("drift_frames", events[CONF_DRIFT_FRAMES]),
     )
 
     in_circuit = {str(inp) for c in config.get(CONF_CIRCUITS, []) for inp in c[CONF_INPUTS]}

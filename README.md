@@ -34,15 +34,21 @@ external_components:
 - **Load events** — every branch clamp and circuit is watched frame by frame
   for steps: a load switching on or off. Each finished step fires
   `on_load_event` with `event`; `event.json()` gives
-  `{"key","age_ms","from_w","to_w","peak_w","va_from","va_to","pf_from","pf_to","noise_w","settle_ms","settled","pulse","dt_ms","samples"}`
+  `{"key","age_ms","from_w","to_w","peak_w","va_from","va_to","pf_from","pf_to","noise_w","settle_ms","settled","pulse","drift","dt_ms","samples"}`
   — where it was, where it went, its inrush peak, the apparent power and
   power factor either side (the load's own reactive part is
   √(va²−w²) to minus from), the level's usual wobble, how long it took to
   settle, and the frames around the step. `pulse` is a step that went and
   came back (an inrush, a brief load); `settled: false` one still moving at
   the timeout. A step must clear the larger of `min_step`, `min_step_percent`
-  of the smaller level, and `noise_factor` times the level's learned wobble,
-  so a noisy or oscillating load stays quiet instead of spamming events.
+  of the smaller level, and `noise_factor` times the level's learned wobble
+  (that part held to `max_noise` if set), so a noisy or oscillating load stays quiet
+  instead of spamming events. A change too gradual or too jittery to make a
+  step (a load fading off, or one switching off a circuit whose wobble hides
+  it) is still reported once a slow average has held two steps away for
+  `drift_frames`: `drift: true`, from and to are averages, and it is dated
+  from when the change began. Change slower than about 5 minutes (a heater
+  sagging as it warms) is followed, not reported.
   Mains clamps and clamps inside a circuit are not watched unless they say
   `load_events: true`; any can say `load_events: false`. The key is the power
   sensor's name without "Power" (`Hot Tub Power` → `hot_tub`), or `key:`.
@@ -78,11 +84,13 @@ sensor:
       min_step: 30W       # a step must move at least this far
       min_step_percent: 2%   # ...and this fraction of the smaller level
       noise_factor: 4     # ...and this many times the level's usual wobble
+      max_noise: 0W       # ...that part held to this if set (never under 1.5x the wobble); 0W no cap
       settle_within: 10W  # settled once settle_frames span no more than this
       settle_within_percent: 3%
       confirm_frames: 2   # 1 s at 500 ms frames
       settle_frames: 4    # 2 s
       timeout: 10s
+      drift_frames: 20    # a gradual change held this long (10 s) is reported; 0 never
     on_load_event:
       - mqtt.publish:
           topic: my-vue/load_event

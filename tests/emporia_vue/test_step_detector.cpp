@@ -102,10 +102,64 @@ static void one_odd_frame_is_not_a_step() {
 static void noise_and_slow_drift_are_not_steps() {
   Run r;
   r.hold(400, 50, NAN, 12);                // ±12 W is under 30 W
-  for (int i = 0; i < 100; i++)
-    r.feed({400 + i * 0.8f});              // 80 W over 20 s
+  for (int i = 0; i < 6000; i++)
+    r.feed({400 + i * 0.01f});             // 60 W over 20 minutes: a heater sagging, not a load switching
   CHECK(r.events.empty());
-  NEAR(r.det.level(), 479, 5);
+  NEAR(r.det.level(), 460, 5);
+}
+
+static void a_load_fading_off_is_reported_once_as_a_gradual_change() {
+  Run r;
+  r.hold(330, 50, 0.99f, 3);
+  for (int i = 0; i < 150; i++)            // 80 W fading off over 30 s, too slowly to make a step
+    r.feed({330 - i * 80 / 150.0f}, 0.99f);
+  r.hold(250, 150, 0.99f, 3);
+  CHECK(r.events.size() == 1);
+  if (r.events.empty())
+    return;
+  const LoadEvent &e = r.events[0];
+  CHECK(e.drift && !e.pulse && !e.settled);
+  NEAR(e.from_w, 330, 6); std::printf("  fade from %.1f to %.1f\n", e.from_w, e.to_w);
+  CHECK(e.to_w < 300 && e.to_w > 240);
+  CHECK(e.start_ms >= 50 * FRAME_MS && e.start_ms < 200 * FRAME_MS);   // dated from the fade, not the report
+  CHECK(e.json().find("\"drift\":true") != std::string::npos);
+  NEAR(e.pf_from(), 0.99f, 0.02f);         // apparent power averaged the same way as real power
+  NEAR(e.pf_to(), 0.99f, 0.02f);
+}
+
+static void a_ramp_is_not_learned_as_wobble() {
+  Run r;
+  r.hold(200, 20, 1.0f, 2);
+  for (int i = 0; i < 60; i++)             // an EV charger ramping 120 W a frame up to 7400 W
+    r.feed({200 + i * 120.0f}, 1.0f);
+  r.hold(7400, 100, 1.0f, 5);
+  size_t up = r.events.size();
+  CHECK(up >= 1 && up <= 3);
+  std::printf("  %zu events for a 60-frame ramp\n", up);
+  CHECK(r.det.noise() < 50);
+  r.hold(200, 30, 1.0f, 2);                // and its switching off is one clean step
+  CHECK(r.events.size() == up + 1);
+}
+
+static void steady_creep_is_not_a_stream_of_small_changes() {
+  Run r;
+  r.hold(500, 20, 1.0f, 2);
+  for (int i = 0; i < 18000; i++)          // 10 W a minute for an hour (frames 200 ms apart)
+    r.feed({500 + i * (10.0f / 300.0f)}, 1.0f);
+  std::printf("  %zu events in an hour of creep\n", r.events.size());
+  CHECK(r.events.size() <= 2);
+}
+
+static void a_load_switching_off_a_jittery_circuit_is_still_seen() {
+  Run r;
+  r.hold(250, 20, 0.99f, 3);
+  for (int i = 0; i < 600; i++)            // a 3D printer's bed switching every few frames: ±60 W
+    r.feed({330 + ((i / 3) % 2 ? 60.0f : -60.0f)}, 0.99f);
+  size_t before = r.events.size();
+  r.hold(250, 150, 0.99f, 3);              // unplugged
+  CHECK(r.events.size() > before);
+  if (r.events.size() > before)
+    CHECK(r.events.back().to_w < 290);
 }
 
 static void a_brief_load_comes_back_as_a_pulse() {
@@ -239,6 +293,10 @@ int main() {
       {"a motor shows its inrush and how long it took to settle", a_motor_shows_its_inrush_and_how_long_it_took_to_settle},
       {"one odd frame is not a step", one_odd_frame_is_not_a_step},
       {"noise and slow drift are not steps", noise_and_slow_drift_are_not_steps},
+      {"a load fading off is reported once as a gradual change", a_load_fading_off_is_reported_once_as_a_gradual_change},
+      {"a load switching off a jittery circuit is still seen", a_load_switching_off_a_jittery_circuit_is_still_seen},
+      {"a ramp is not learned as wobble", a_ramp_is_not_learned_as_wobble},
+      {"steady creep is not a stream of small changes", steady_creep_is_not_a_stream_of_small_changes},
       {"a brief load comes back as a pulse", a_brief_load_comes_back_as_a_pulse},
       {"a load that never settles is reported when it times out", a_load_that_never_settles_is_reported_when_it_times_out},
       {"steps follow on from each other", steps_follow_on_from_each_other},
