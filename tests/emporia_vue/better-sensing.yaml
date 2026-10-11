@@ -22,6 +22,8 @@ wifi:
 
 mqtt:
   broker: 192.168.0.2
+  on_connect:
+    - lambda: id(vue).replay_load_events();
 
 i2c:
   sda: 5
@@ -30,6 +32,7 @@ i2c:
 
 sensor:
   - platform: emporia_vue
+    id: vue
     variant: vue3
     publish_interval: 5s
     frame_rate:
@@ -80,6 +83,8 @@ sensor:
       timeout: 15s
       max_noise: 120W
       drift_frames: 30
+    unmetered:
+      inputs: ["1", "2", "3", "4", "5"]
     on_load_event:
       - mqtt.publish:
           topic: vue-test/load_event

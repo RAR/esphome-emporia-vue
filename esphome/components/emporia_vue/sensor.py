@@ -61,6 +61,8 @@ CONF_SETTLE_FRAMES = "settle_frames"
 CONF_MAX_NOISE = "max_noise"
 CONF_DRIFT_FRAMES = "drift_frames"
 CONF_CYCLE_STEPS = "cycle_steps"
+CONF_CURRENT_FLOOR = "current_floor"
+CONF_UNMETERED = "unmetered"
 CONF_CYCLE_TOLERANCE = "cycle_tolerance"
 CONF_CYCLE_WINDOW = "cycle_window"
 CONF_TIMEOUT = "timeout"
@@ -344,6 +346,18 @@ CONFIG_SCHEMA = cv.All(
                 icon="mdi:alert-circle-outline",
             ),
             cv.Optional(CONF_STEP_DETECTION, default={}): SCHEMA_STEP_DETECTION,
+            # Take each clamp's own noise (~0.12 A idle) out of its current, apparent power and power factor.
+            cv.Optional(CONF_CURRENT_FLOOR, default=True): cv.boolean,
+            # Watch what the mains carry that the listed branch clamps do not: loads on breakers without
+            # a clamp. List the inputs whose breakers are under these mains.
+            cv.Optional(CONF_UNMETERED): cv.Schema(
+                {
+                    cv.Optional(CONF_KEY, default="unmetered"): cv.string_strict,
+                    cv.Required(CONF_INPUTS): cv.ensure_list(cv.enum(CT_INPUT)),
+                    # The mains read current 4x coarser than a branch clamp, so a step must be bigger.
+                    cv.Optional(CONF_MIN_STEP, default="80W"): watts,
+                }
+            ),
             cv.Optional(CONF_ON_UPDATE): automation.validate_automation(
                 {
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
@@ -378,6 +392,25 @@ async def _measured(var, item, step_config, watching, default, fallback):
             cg.add(setter(await sensor.new_sensor(item[conf])))
     if watching and item.get(CONF_LOAD_EVENTS, default):
         cg.add(var.set_load_events(_key(item, fallback), step_config))
+
+
+def _step_config(events, min_step=None):
+    return cg.StructInitializer(
+        StepConfig,
+        ("min_step_w", events[CONF_MIN_STEP] if min_step is None else min_step),
+        ("rel_step", events[CONF_MIN_STEP_PERCENT]),
+        ("noise_factor", events[CONF_NOISE_FACTOR]),
+        ("max_noise_w", events[CONF_MAX_NOISE]),
+        ("settle_w", events[CONF_SETTLE_WITHIN]),
+        ("settle_rel", events[CONF_SETTLE_WITHIN_PERCENT]),
+        ("confirm", events[CONF_CONFIRM_FRAMES]),
+        ("settle_frames", events[CONF_SETTLE_FRAMES]),
+        ("timeout_ms", events[CONF_TIMEOUT].total_milliseconds),
+        ("drift_frames", events[CONF_DRIFT_FRAMES]),
+        ("cycle_steps", events[CONF_CYCLE_STEPS]),
+        ("cycle_tolerance", events[CONF_CYCLE_TOLERANCE]),
+        ("cycle_window_ms", events[CONF_CYCLE_WINDOW].total_milliseconds),
+    )
 
 
 async def to_code(config):
@@ -420,22 +453,7 @@ async def to_code(config):
 
     events = config[CONF_STEP_DETECTION]
     watching = CONF_ON_LOAD_EVENT in config
-    step_config = cg.StructInitializer(
-        StepConfig,
-        ("min_step_w", events[CONF_MIN_STEP]),
-        ("rel_step", events[CONF_MIN_STEP_PERCENT]),
-        ("noise_factor", events[CONF_NOISE_FACTOR]),
-        ("max_noise_w", events[CONF_MAX_NOISE]),
-        ("settle_w", events[CONF_SETTLE_WITHIN]),
-        ("settle_rel", events[CONF_SETTLE_WITHIN_PERCENT]),
-        ("confirm", events[CONF_CONFIRM_FRAMES]),
-        ("settle_frames", events[CONF_SETTLE_FRAMES]),
-        ("timeout_ms", events[CONF_TIMEOUT].total_milliseconds),
-        ("drift_frames", events[CONF_DRIFT_FRAMES]),
-        ("cycle_steps", events[CONF_CYCLE_STEPS]),
-        ("cycle_tolerance", events[CONF_CYCLE_TOLERANCE]),
-        ("cycle_window_ms", events[CONF_CYCLE_WINDOW].total_milliseconds),
-    )
+    step_config = _step_config(events)
 
     in_circuit = {str(inp) for c in config.get(CONF_CIRCUITS, []) for inp in c[CONF_INPUTS]}
     ct_clamps = []
@@ -447,6 +465,8 @@ async def to_code(config):
         cg.add(ct_clamp_var.set_input_port(ct_config[CONF_INPUT]))
         if ct_config[CONF_REVERSE]:
             cg.add(ct_clamp_var.set_reverse(True))
+        if not config[CONF_CURRENT_FLOOR]:
+            cg.add(ct_clamp_var.set_current_floor(False))
 
         inp = str(ct_config[CONF_INPUT])
         default = inp not in MAINS_INPUTS and inp not in in_circuit
@@ -455,6 +475,14 @@ async def to_code(config):
         ct_clamps.append(ct_clamp_var)
         by_input[inp] = ct_clamp_var
     cg.add(var.set_ct_clamps(ct_clamps))
+
+    if CONF_UNMETERED in config and watching:
+        unmetered = config[CONF_UNMETERED]
+        for inp in unmetered[CONF_INPUTS]:
+            if str(inp) in MAINS_INPUTS or str(inp) not in by_input:
+                raise cv.Invalid(f"unmetered: input {inp} must be a branch clamp listed under ct_clamps")
+        cg.add(var.set_unmetered(unmetered[CONF_KEY], _step_config(events, unmetered[CONF_MIN_STEP]),
+                                 [by_input[str(inp)] for inp in unmetered[CONF_INPUTS]]))
 
     circuits = []
     for circuit_config in config.get(CONF_CIRCUITS, []):

@@ -1,4 +1,6 @@
 #include "emporia_vue.h"
+
+#include <cstring>
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
@@ -118,6 +120,20 @@ void EmporiaVueComponent::update() {
         this->report_load_event(*event);
     }
   }
+  if (this->unmetered_ != nullptr) {
+    // What the mains carry that no listed branch clamp does: loads on breakers without a clamp.
+    float watts = 0;
+    for (auto *ct_clamp : this->ct_clamps_)
+      if (ct_clamp->is_mains())
+        watts += ct_clamp->get_power();
+    for (auto *ct_clamp : this->unmetered_under_)
+      watts -= ct_clamp->get_power();
+    if (this->unmetered_->feed(watts, NAN, now)) {
+      do
+        this->report_load_event(this->unmetered_->event());
+      while (this->unmetered_->next());
+    }
+  }
 
   if (this->publish_interval_ms_ == 0 || now - this->last_flush_ms_ >= this->publish_interval_ms_) {
     this->last_flush_ms_ = now;
@@ -160,21 +176,52 @@ void EmporiaVueComponent::add_on_load_event_callback(std::function<void(const Lo
   this->load_event_callback_.add(std::move(callback));
 }
 
+static constexpr uint32_t WITH_WITHIN_MS = 700;  // events this close at their start began together
+
 void EmporiaVueComponent::report_load_event(const LoadEvent &event) {
   ESP_LOGD(TAG, "Load event on %s: %.0f W -> %.0f W (peak %.0f W, settled in %u ms)", event.key, event.from_w,
            event.to_w, event.peak_w, (unsigned) event.settle_ms);
   LoadEvent reported = event;
   reported.reported_ms = millis();
+  reported.seq = ++this->seq_;
+  reported.replay = false;
+  // Other channels' events that began within a frame of this one, from those just sent.
+  reported.with_count = 0;
+  for (uint8_t i = 0; i < this->sent_n_ && reported.with_count < LoadEvent::MAX_WITH; i++) {
+    const LoadEvent &other = this->sent_[(this->sent_head_ + REPLAY - 1 - i) % REPLAY];
+    uint32_t apart = other.start_ms > event.start_ms ? other.start_ms - event.start_ms : event.start_ms - other.start_ms;
+    if (apart <= WITH_WITHIN_MS && strcmp(other.key, event.key) != 0 && !other.cycling && !event.cycling)
+      reported.with_keys[reported.with_count++] = other.key;
+  }
+  this->sent_[this->sent_head_] = reported;
+  this->sent_head_ = (this->sent_head_ + 1) % REPLAY;
+  this->sent_n_ = std::min<uint8_t>(this->sent_n_ + 1, REPLAY);
   this->load_event_callback_.call(reported);
+}
+
+void EmporiaVueComponent::replay_load_events() {
+  ESP_LOGD(TAG, "Replaying the last %u load events", (unsigned) this->sent_n_);
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < this->sent_n_; i++) {
+    LoadEvent again = this->sent_[(this->sent_head_ + REPLAY - this->sent_n_ + i) % REPLAY];
+    again.replay = true;
+    again.reported_ms = now;  // its age is still counted from when it began
+    this->load_event_callback_.call(again);
+  }
 }
 
 void EmporiaVueComponent::add_on_update_callback(std::function<void()> &&callback) {
   this->callback_.add(std::move(callback));
 }
 
+static constexpr float CURRENT_FLOOR_IDLE_W = 3.0f;   // below this a frame's current is the clamp's noise
+static constexpr uint32_t CURRENT_FLOOR_FRAMES = 60;  // idle frames seen before the floor is taken out
+
 static inline bool is_mains_port(CTInputPort port) {
   return port == CTInputPort::A || port == CTInputPort::B || port == CTInputPort::C;
 }
+
+bool CTClampConfig::is_mains() const { return is_mains_port(this->input_port_); }
 
 void PhaseConfig::update_from_reading(const SensorReading &sensor_reading) {
   this->voltage_now_ = sensor_reading.voltage[this->input_wire_] * this->calibration_;
@@ -227,7 +274,18 @@ void CTClampConfig::update_from_reading(const SensorReading &sensor_reading) {
   } else {
     scalar = 775.0 / 170496.0;
   }
-  this->current_now_ = raw_current * scalar;
+  float amps = raw_current * scalar;
+  if (this->current_floor_) {
+    // With next to no power through it, what the clamp reads is its noise: learn its square, and take it
+    // out in quadrature (noise adds to a load's current as RMS does), once it has been seen for long enough.
+    if (std::fabs(this->power_now_) < CURRENT_FLOOR_IDLE_W) {
+      this->floor_sq_ += (amps * amps - this->floor_sq_) / (this->floor_n_ < 50 ? this->floor_n_ + 1 : 50);
+      this->floor_n_++;
+    }
+    if (this->floor_n_ >= CURRENT_FLOOR_FRAMES)
+      amps = std::sqrt(std::max(amps * amps - this->floor_sq_, 0.0f));
+  }
+  this->current_now_ = amps;
   this->va_now_ = this->current_now_ * this->phase_->get_voltage();
 
   this->power_.add(this->power_now_);

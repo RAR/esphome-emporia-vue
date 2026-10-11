@@ -61,6 +61,32 @@ external_components:
   `"cycling":"end"` (from its mean, `held_w`, to the level after), each with
   `amp_w`, `period_ms` and `duty`. The switches between are not reported. A
   step that does not fit (another load switching) ends it and is reported.
+  As each event is reported the component adds `seq` (counting up across the
+  node's events from 1 at boot; a gap is an event lost) and `with`: other
+  channels whose event began within 700 ms (a 240 V load on both legs, a
+  branch step also seen on the mains). `replay_load_events()` sends the last 8
+  again with `"replay":true` — call it when MQTT reconnects, and drop the ones
+  you already have by `seq`:
+
+  ```yaml
+  mqtt:
+    on_connect:
+      - lambda: id(vue).replay_load_events();
+  ```
+- **`current_floor:`** (default `true`) — an idle clamp still reads ~0.12 A of
+  noise, which makes a 50 W load look far less resistive than it is. Each
+  clamp learns its noise from frames with next to no power and takes it out of
+  its current (in quadrature), so current, apparent power and power factor of
+  small loads read true. `false` keeps the raw current.
+- **`unmetered:`** — a detector on what the mains carry that the listed branch
+  clamps do not: loads on breakers without a clamp. List every input whose
+  breaker is under these mains; events come under `key` (`unmetered`), with a
+  bigger `min_step` (80 W) since the mains read current 4x coarser.
+
+  ```yaml
+  unmetered:
+    inputs: ["1", "2", "3", "4"]
+  ```
   Mains clamps and clamps inside a circuit are not watched unless they say
   `load_events: true`; any can say `load_events: false`. The key is the power
   sensor's name without "Power" (`Hot Tub Power` → `hot_tub`), or `key:`.

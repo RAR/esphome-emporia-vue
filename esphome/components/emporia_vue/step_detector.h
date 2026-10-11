@@ -78,6 +78,14 @@ struct LoadEvent {
   uint8_t cycling{0};
   float amp_w{NAN}, duty{NAN};
   uint32_t period_ms{0}, spans_ms{0};
+  // Set by the component as it reports: a number counting up across the node's events (from 1 at boot),
+  // whether this is a repeat sent after the connection came back, and other channels whose event began
+  // within a frame of this one's (a 240 V load on both legs, a branch step also seen on the mains).
+  uint32_t seq{0};
+  bool replay{false};
+  static constexpr uint8_t MAX_WITH = 2;
+  uint8_t with_count{0};
+  const char *with_keys[MAX_WITH]{};
   uint32_t first_ms{0}, last_ms{0};  // the first and last stored samples
   uint32_t reported_ms{0};           // when it was handed on (set by the component)
   uint8_t count{0};
@@ -131,6 +139,21 @@ struct LoadEvent {
       out += buf;
     }
     out += ']';
+    if (this->seq) {
+      snprintf(buf, sizeof(buf), ",\"seq\":%u", (unsigned) this->seq);
+      out += buf;
+    }
+    if (this->replay)
+      out += ",\"replay\":true";
+    if (this->with_count) {
+      out += ",\"with\":[";
+      for (uint8_t i = 0; i < this->with_count; i++) {
+        out += i ? ",\"" : "\"";
+        out += this->with_keys[i];
+        out += '"';
+      }
+      out += ']';
+    }
     if (this->cycling) {
       snprintf(buf, sizeof(buf), ",\"cycling\":\"%s\"", this->cycling == 1 ? "start" : "end");
       out += buf;
@@ -706,7 +729,7 @@ class StepDetector {
     e.pulse = std::fabs(mean - e.from_w) < this->threshold(e.from_w, mean);
     e.settle_ms = this->win_ms_[this->recent(0, have)] - e.start_ms;
     this->stages(e, have);
-    if (e.pulse)
+    if (e.pulse || !settled)  // a step still moving at the timeout has no levels to tell
       e.stage_count = 0;
     // The settled frames are the new level and lead into the next step.
     this->base_ = mean;

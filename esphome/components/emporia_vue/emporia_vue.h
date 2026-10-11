@@ -104,6 +104,15 @@ class EmporiaVueComponent : public PollingComponent, public i2c::I2CDevice {
 
   void add_on_update_callback(std::function<void()> &&callback);
   void add_on_load_event_callback(std::function<void(const LoadEvent &)> &&callback);
+  // Sends the last REPLAY events again, marked as repeats (call it when the connection comes back:
+  // the receiver drops those it has by their seq, and a gap in seq is an event lost for good).
+  void replay_load_events();
+  // A detector on what the mains see that the listed branch clamps do not (loads on breakers
+  // without a clamp), under `key`.
+  void set_unmetered(const char *key, StepConfig cfg, std::vector<CTClampConfig *> under) {
+    this->unmetered_ = new StepDetector(key, cfg);  // NOLINT
+    this->unmetered_under_ = std::move(under);
+  }
   void report_load_event(const LoadEvent &event);
 
  protected:
@@ -117,6 +126,12 @@ class EmporiaVueComponent : public PollingComponent, public i2c::I2CDevice {
   std::vector<CircuitConfig *> circuits_;
   CallbackManager<void()> callback_;
   CallbackManager<void(const LoadEvent &)> load_event_callback_;
+  static constexpr uint8_t REPLAY = 8;
+  LoadEvent sent_[REPLAY];                // the last events reported, oldest overwritten
+  uint8_t sent_head_{0}, sent_n_{0};
+  uint32_t seq_{0};
+  StepDetector *unmetered_{nullptr};
+  std::vector<CTClampConfig *> unmetered_under_;
 
   uint32_t publish_interval_ms_{0};  // 0: every frame
   uint32_t last_flush_ms_{0};
@@ -212,6 +227,10 @@ class CTClampConfig : public sensor::Sensor {
   void set_power_factor_sensor(sensor::Sensor *s) { this->power_factor_.sensor = s; }
   sensor::Sensor *get_power_factor_sensor() const { return this->power_factor_.sensor; }
   void set_reverse(bool reverse) { this->reverse_ = reverse; }
+  // Take the clamp's own noise out of its current (and so its apparent power and power factor): an
+  // idle clamp still reads ~0.12 A, which makes a small load look far less resistive than it is.
+  void set_current_floor(bool on) { this->current_floor_ = on; }
+  bool is_mains() const;
   void set_load_events(const char *key, StepConfig cfg) {
     cfg.min_va = this->get_min_va();
     this->detector_ = new StepDetector(key, cfg);  // NOLINT
@@ -233,6 +252,9 @@ class CTClampConfig : public sensor::Sensor {
   PhaseConfig *phase_;
   CTInputPort input_port_;
   bool reverse_{false};
+  bool current_floor_{true};
+  float floor_sq_{0};        // the noise floor's square (A^2), learned from frames with next to no power
+  uint32_t floor_n_{0};
   float power_now_{NAN}, current_now_{NAN}, va_now_{NAN};
   Averaged power_;
   Averaged current_;

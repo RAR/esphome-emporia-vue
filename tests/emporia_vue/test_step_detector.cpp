@@ -433,6 +433,23 @@ static void a_motor_s_settling_is_not_a_stage() {
     CHECK(r.events[0].stage_count == 0);
 }
 
+
+static void the_component_s_marks_read_in_the_json() {
+  LoadEvent e;
+  e.key = "hot_tub";
+  e.from_w = 46;
+  e.to_w = 957;
+  std::string plain = e.to_json(0);
+  CHECK(plain.find("\"seq\"") == std::string::npos && plain.find("\"with\"") == std::string::npos);
+  e.seq = 42;
+  e.replay = true;
+  e.with_keys[e.with_count++] = "bar_wall";
+  std::string json = e.to_json(0);
+  CHECK(json.find("\"seq\":42") != std::string::npos);
+  CHECK(json.find("\"replay\":true") != std::string::npos);
+  CHECK(json.find("\"with\":[\"bar_wall\"]") != std::string::npos);
+}
+
 int main() {
   struct {
     const char *name;
@@ -453,6 +470,7 @@ int main() {
       {"a cycle's mean leaves out the step that ended it and the quiet after", a_cycle_s_mean_leaves_out_the_step_that_ended_it_and_the_quiet_after},
       {"a long first on ends with its own step down", a_long_first_on_ends_with_its_own_step_down},
       {"a motor's settling is not a stage", a_motor_s_settling_is_not_a_stage},
+      {"the component's marks read in the json", the_component_s_marks_read_in_the_json},
       {"a brief load comes back as a pulse", a_brief_load_comes_back_as_a_pulse},
       {"a load that never settles is reported when it times out", a_load_that_never_settles_is_reported_when_it_times_out},
       {"steps follow on from each other", steps_follow_on_from_each_other},
