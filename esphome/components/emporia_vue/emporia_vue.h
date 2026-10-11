@@ -195,7 +195,13 @@ class CTClampConfig : public sensor::Sensor {
  public:
   void set_phase(PhaseConfig *phase) { this->phase_ = phase; };
   const PhaseConfig *get_phase() const { return this->phase_; }
-  void set_input_port(CTInputPort input_port) { this->input_port_ = input_port; };
+  void set_input_port(CTInputPort input_port) {
+    this->input_port_ = input_port;
+    this->power_factor_.min_va = this->get_min_va();
+  };
+  // The apparent power below which this clamp's current is mostly noise: the
+  // mains ports' current is scaled 4x coarser than the branch ports'.
+  float get_min_va() const { return MIN_POWER_FACTOR_VA * (this->input_port_ < 3 ? 4.0f : 1.0f); }
   CTInputPort get_input_port() const { return this->input_port_; }
   void set_power_sensor(sensor::Sensor *power_sensor) { this->power_.sensor = power_sensor; }
   sensor::Sensor *get_power_sensor() const { return this->power_.sensor; }
@@ -206,7 +212,10 @@ class CTClampConfig : public sensor::Sensor {
   void set_power_factor_sensor(sensor::Sensor *s) { this->power_factor_.sensor = s; }
   sensor::Sensor *get_power_factor_sensor() const { return this->power_factor_.sensor; }
   void set_reverse(bool reverse) { this->reverse_ = reverse; }
-  void set_load_events(const char *key, StepConfig cfg) { this->detector_ = new StepDetector(key, cfg); }  // NOLINT
+  void set_load_events(const char *key, StepConfig cfg) {
+    cfg.min_va = this->get_min_va();
+    this->detector_ = new StepDetector(key, cfg);  // NOLINT
+  }
 
   void update_from_reading(const SensorReading &sensor_reading);
   float get_calibrated_power(int32_t raw_power) const;
@@ -235,17 +244,23 @@ class CTClampConfig : public sensor::Sensor {
 // clamp on each leg: its power is their sum, its current the larger leg's.
 class CircuitConfig {
  public:
-  // Each clamp adds its own current noise floor, so power factor needs proportionally more.
+  // Each clamp adds its own current noise floor, so power factor needs their sum.
   void set_clamps(std::vector<CTClampConfig *> clamps) {
     this->clamps_ = std::move(clamps);
-    this->power_factor_.min_va = MIN_POWER_FACTOR_VA * this->clamps_.size();
+    this->power_factor_.min_va = this->get_min_va();
+  }
+  float get_min_va() const {
+    float sum = 0;
+    for (auto *clamp : this->clamps_)
+      sum += clamp->get_min_va();
+    return sum;
   }
   void set_power_sensor(sensor::Sensor *s) { this->power_.sensor = s; }
   void set_current_sensor(sensor::Sensor *s) { this->current_.sensor = s; }
   void set_apparent_power_sensor(sensor::Sensor *s) { this->apparent_power_.sensor = s; }
   void set_power_factor_sensor(sensor::Sensor *s) { this->power_factor_.sensor = s; }
   void set_load_events(const char *key, StepConfig cfg) {
-    cfg.min_va = MIN_POWER_FACTOR_VA * this->clamps_.size();
+    cfg.min_va = this->get_min_va();
     this->detector_ = new StepDetector(key, cfg);  // NOLINT
   }
 
