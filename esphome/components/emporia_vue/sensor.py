@@ -2,6 +2,7 @@ from esphome.components import sensor, i2c
 from esphome import automation
 import esphome.config_validation as cv
 import esphome.codegen as cg
+from esphome.helpers import sanitize, snake_case
 import re
 
 from esphome.const import (
@@ -183,7 +184,8 @@ SCHEMA_LOAD_EVENTS = cv.Schema(
 
 
 def _slug(text):
-    return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
+    # The object id ESPHome gives an entity of that name (its MQTT topic's).
+    return sanitize(snake_case(str(text)))
 
 
 def _key(item, fallback):
