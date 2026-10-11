@@ -67,6 +67,7 @@ struct Averaged {
 // apparent power; unknown when the current was too low to tell.
 struct AveragedPowerFactor {
   sensor::Sensor *sensor{nullptr};
+  float min_va{MIN_POWER_FACTOR_VA};
   double watts{0}, va{0};
   uint32_t n{0};
 
@@ -79,7 +80,7 @@ struct AveragedPowerFactor {
   }
   void flush() {
     if (this->sensor != nullptr && this->n)
-      this->sensor->publish_state(power_factor(this->watts / this->n, this->va / this->n));
+      this->sensor->publish_state(power_factor(this->watts / this->n, this->va / this->n, this->min_va));
     this->watts = 0;
     this->va = 0;
     this->n = 0;
@@ -234,12 +235,19 @@ class CTClampConfig : public sensor::Sensor {
 // clamp on each leg: its power is their sum, its current the larger leg's.
 class CircuitConfig {
  public:
-  void set_clamps(std::vector<CTClampConfig *> clamps) { this->clamps_ = std::move(clamps); }
+  // Each clamp adds its own current noise floor, so power factor needs proportionally more.
+  void set_clamps(std::vector<CTClampConfig *> clamps) {
+    this->clamps_ = std::move(clamps);
+    this->power_factor_.min_va = MIN_POWER_FACTOR_VA * this->clamps_.size();
+  }
   void set_power_sensor(sensor::Sensor *s) { this->power_.sensor = s; }
   void set_current_sensor(sensor::Sensor *s) { this->current_.sensor = s; }
   void set_apparent_power_sensor(sensor::Sensor *s) { this->apparent_power_.sensor = s; }
   void set_power_factor_sensor(sensor::Sensor *s) { this->power_factor_.sensor = s; }
-  void set_load_events(const char *key, StepConfig cfg) { this->detector_ = new StepDetector(key, cfg); }  // NOLINT
+  void set_load_events(const char *key, StepConfig cfg) {
+    cfg.min_va = MIN_POWER_FACTOR_VA * this->clamps_.size();
+    this->detector_ = new StepDetector(key, cfg);  // NOLINT
+  }
 
   void update_from_clamps();
   const LoadEvent *detect(uint32_t now);

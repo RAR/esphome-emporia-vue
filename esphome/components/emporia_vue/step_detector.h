@@ -17,13 +17,13 @@
 namespace esphome {
 namespace emporia_vue {
 
-// Below this apparent power the current reading is mostly the clamp's noise
-// floor (an idle clamp reads ~0.12 A), so a power factor means nothing.
+// Below this apparent power per clamp the current reading is mostly the
+// clamp's noise floor (an idle clamp reads ~0.12 A), so a power factor means nothing.
 static constexpr float MIN_POWER_FACTOR_VA = 25.0f;
 
 // The power factor of real and apparent power, or NAN when there is too little to tell.
-inline float power_factor(float watts, float va) {
-  if (std::isnan(watts) || std::isnan(va) || va < MIN_POWER_FACTOR_VA)
+inline float power_factor(float watts, float va, float min_va = MIN_POWER_FACTOR_VA) {
+  if (std::isnan(watts) || std::isnan(va) || va < min_va)
     return NAN;
   return std::min(1.0f, std::fabs(watts) / va);
 }
@@ -37,6 +37,7 @@ struct StepConfig {
   uint8_t confirm = 2;         // frames away from the level before it counts as a step
   uint8_t settle_frames = 4;   // frames that must agree to call it settled (at most 8)
   uint32_t timeout_ms = 10000; // a step that has not settled by then is reported as is
+  float min_va = MIN_POWER_FACTOR_VA;  // power factor is unknown below this (per clamp, summed for a circuit)
 };
 
 struct LoadEvent {
@@ -46,6 +47,7 @@ struct LoadEvent {
   float from_w{0}, to_w{0}, peak_w{0};
   float va_from{NAN}, va_to{NAN};  // apparent power either side; NAN without a current reading
   float noise_w{0};                // the level's usual wobble (mean absolute deviation)
+  float min_va{MIN_POWER_FACTOR_VA};
   uint32_t start_ms{0};            // the first frame that moved
   uint32_t settle_ms{0};           // from start_ms to the first of the settled frames
   bool settled{false};             // false when it timed out still moving
@@ -55,8 +57,8 @@ struct LoadEvent {
   uint8_t count{0};
   float samples[MAX_SAMPLES]{};    // frames from just before the step onwards (W)
 
-  float pf_from() const { return power_factor(this->from_w, this->va_from); }
-  float pf_to() const { return power_factor(this->to_w, this->va_to); }
+  float pf_from() const { return power_factor(this->from_w, this->va_from, this->min_va); }
+  float pf_to() const { return power_factor(this->to_w, this->va_to, this->min_va); }
 
   // As JSON, with age_ms counted to when it was reported.
   std::string json() const { return this->to_json(this->reported_ms); }
@@ -113,6 +115,7 @@ class StepDetector {
 
   explicit StepDetector(const char *key = "", StepConfig cfg = {}) : cfg_(cfg) {
     this->event_.key = key;
+    this->event_.min_va = this->cfg_.min_va;
     this->cfg_.settle_frames = std::max<uint8_t>(2, std::min<uint8_t>(this->cfg_.settle_frames, WINDOW));
     this->cfg_.confirm = std::max<uint8_t>(1, std::min<uint8_t>(this->cfg_.confirm, WINDOW));
   }
