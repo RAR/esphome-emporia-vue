@@ -63,31 +63,28 @@ struct Averaged {
   }
 };
 
-// Power factor over the same span: the summed real power over the summed apparent power.
+// Power factor over the same span: the summed real power over the summed
+// apparent power; unknown when the current was too low to tell.
 struct AveragedPowerFactor {
   sensor::Sensor *sensor{nullptr};
   double watts{0}, va{0};
+  uint32_t n{0};
 
   void add(float w, float s) {
     if (this->sensor != nullptr && !std::isnan(w) && !std::isnan(s)) {
       this->watts += std::fabs(w);
       this->va += s;
+      this->n++;
     }
   }
   void flush() {
-    if (this->sensor != nullptr && this->va > 1.0)
-      this->sensor->publish_state(std::min(1.0, this->watts / this->va));
+    if (this->sensor != nullptr && this->n)
+      this->sensor->publish_state(power_factor(this->watts / this->n, this->va / this->n));
     this->watts = 0;
     this->va = 0;
+    this->n = 0;
   }
 };
-
-// The power factor of one frame, or NAN when there is too little current to tell.
-inline float power_factor(float watts, float va) {
-  if (std::isnan(watts) || std::isnan(va) || va < 5.0f)
-    return NAN;
-  return std::min(1.0f, std::fabs(watts) / va);
-}
 
 class EmporiaVueComponent : public PollingComponent, public i2c::I2CDevice {
  public:

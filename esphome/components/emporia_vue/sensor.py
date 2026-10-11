@@ -50,6 +50,8 @@ CONF_PUBLISH_INTERVAL = "publish_interval"
 CONF_FRAME_RATE = "frame_rate"
 CONF_MISSED_FRAMES = "missed_frames"
 CONF_LOAD_EVENTS = "load_events"
+CONF_STEP_DETECTION = "step_detection"
+CONF_NOISE_FACTOR = "noise_factor"
 CONF_MIN_STEP = "min_step"
 CONF_MIN_STEP_PERCENT = "min_step_percent"
 CONF_SETTLE_WITHIN = "settle_within"
@@ -167,10 +169,11 @@ SCHEMA_CIRCUIT = {
     **SCHEMA_MEASURED,
 }
 
-SCHEMA_LOAD_EVENTS = cv.Schema(
+SCHEMA_STEP_DETECTION = cv.Schema(
     {
         cv.Optional(CONF_MIN_STEP, default="30W"): watts,
-        cv.Optional(CONF_MIN_STEP_PERCENT, default="5%"): cv.percentage,
+        cv.Optional(CONF_MIN_STEP_PERCENT, default="2%"): cv.percentage,
+        cv.Optional(CONF_NOISE_FACTOR, default=4.0): cv.float_range(min=0, max=20),
         cv.Optional(CONF_SETTLE_WITHIN, default="10W"): watts,
         cv.Optional(CONF_SETTLE_WITHIN_PERCENT, default="3%"): cv.percentage,
         cv.Optional(CONF_CONFIRM_FRAMES, default=2): cv.int_range(min=1, max=8),
@@ -255,17 +258,17 @@ def validate_phases(val):
 def validate_channels(config):
     """Circuits name clamps that exist and are in no other circuit; event keys are unique."""
     clamp_inputs = [str(ct[CONF_INPUT]) for ct in config[CONF_CT_CLAMPS]]
-    for i, ct in enumerate(config[CONF_CT_CLAMPS]):
-        if clamp_inputs.index(str(ct[CONF_INPUT])) != i:
-            raise cv.Invalid(
-                f"Input {ct[CONF_INPUT]} is listed twice", path=[CONF_CT_CLAMPS, i, CONF_INPUT]
-            )
     in_circuit = set()
     for i, circuit in enumerate(config.get(CONF_CIRCUITS, [])):
         for j, inp in enumerate(circuit[CONF_INPUTS]):
             path = [CONF_CIRCUITS, i, CONF_INPUTS, j]
             if str(inp) not in clamp_inputs:
                 raise cv.Invalid(f"Input {inp} is not listed under ct_clamps", path=path)
+            if clamp_inputs.count(str(inp)) > 1:
+                raise cv.Invalid(
+                    f"Input {inp} is listed more than once under ct_clamps, so the circuit cannot tell which",
+                    path=path,
+                )
             if str(inp) in in_circuit:
                 raise cv.Invalid(f"Input {inp} is already in another circuit", path=path)
             in_circuit.add(str(inp))
@@ -323,7 +326,7 @@ CONFIG_SCHEMA = cv.All(
                 accuracy_decimals=0,
                 icon="mdi:alert-circle-outline",
             ),
-            cv.Optional(CONF_LOAD_EVENTS, default={}): SCHEMA_LOAD_EVENTS,
+            cv.Optional(CONF_STEP_DETECTION, default={}): SCHEMA_STEP_DETECTION,
             cv.Optional(CONF_ON_UPDATE): automation.validate_automation(
                 {
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
@@ -398,12 +401,13 @@ async def to_code(config):
     if CONF_MISSED_FRAMES in config:
         cg.add(var.set_missed_frames_sensor(await sensor.new_sensor(config[CONF_MISSED_FRAMES])))
 
-    events = config[CONF_LOAD_EVENTS]
+    events = config[CONF_STEP_DETECTION]
     watching = CONF_ON_LOAD_EVENT in config
     step_config = cg.StructInitializer(
         StepConfig,
         ("min_step_w", events[CONF_MIN_STEP]),
         ("rel_step", events[CONF_MIN_STEP_PERCENT]),
+        ("noise_factor", events[CONF_NOISE_FACTOR]),
         ("settle_w", events[CONF_SETTLE_WITHIN]),
         ("settle_rel", events[CONF_SETTLE_WITHIN_PERCENT]),
         ("confirm", events[CONF_CONFIRM_FRAMES]),

@@ -11,7 +11,8 @@ The older README that was previously here [is still available](https://github.co
 ## This fork: better sensing
 
 A drop-in `emporia_vue` with more out of each frame the Vue's meter chip sends
-(about five a second), all optional; configurations written for upstream work unchanged.
+(a Vue 3 delivers one about every 500 ms; the component polls every 200 ms so
+none are missed), all optional; configurations written for upstream work unchanged.
 
 ```yaml
 external_components:
@@ -21,7 +22,8 @@ external_components:
 
 - **Power factor and apparent power per clamp** — `power_factor:` and
   `apparent_power:` beside `power:` and `current:`, from each input's current
-  and its phase's voltage.
+  and its phase's voltage. Power factor is unknown below 25 VA, where the
+  current reading is mostly the clamp's noise floor (an idle clamp reads ~0.12 A).
 - **Circuits on more than one clamp** — a 240 V breaker with a clamp on each
   leg is one entry under `circuits:` (`inputs: ["3", "4"]`): its power is the
   sum, its current the larger leg's. No template sensors to keep in step.
@@ -32,10 +34,15 @@ external_components:
 - **Load events** — every branch clamp and circuit is watched frame by frame
   for steps: a load switching on or off. Each finished step fires
   `on_load_event` with `event`; `event.json()` gives
-  `{"key","age_ms","from_w","to_w","peak_w","settle_ms","settled","pf_from","pf_to","dt_ms","samples"}`
-  — where it was, where it went, its inrush peak, how long it took to settle,
-  the power factor either side, and the frames around the step. A step that
-  goes and comes back (an inrush, a brief load) has `to_w` near `from_w`.
+  `{"key","age_ms","from_w","to_w","peak_w","va_from","va_to","pf_from","pf_to","noise_w","settle_ms","settled","pulse","dt_ms","samples"}`
+  — where it was, where it went, its inrush peak, the apparent power and
+  power factor either side (the load's own reactive part is
+  √(va²−w²) to minus from), the level's usual wobble, how long it took to
+  settle, and the frames around the step. `pulse` is a step that went and
+  came back (an inrush, a brief load); `settled: false` one still moving at
+  the timeout. A step must clear the larger of `min_step`, `min_step_percent`
+  of the smaller level, and `noise_factor` times the level's learned wobble,
+  so a noisy or oscillating load stays quiet instead of spamming events.
   Mains clamps and clamps inside a circuit are not watched unless they say
   `load_events: true`; any can say `load_events: false`. The key is the power
   sensor's name without "Power" (`Hot Tub Power` → `hot_tub`), or `key:`.
@@ -67,13 +74,14 @@ sensor:
       - inputs: ["1", "2"]
         power: { name: Dryer Power, id: dryer_power }
         current: { name: Dryer Current }
-    load_events:          # all optional; these are the defaults
+    step_detection:       # all optional; these are the defaults
       min_step: 30W       # a step must move at least this far
-      min_step_percent: 5%   # ...and this fraction of the level it left
+      min_step_percent: 2%   # ...and this fraction of the smaller level
+      noise_factor: 4     # ...and this many times the level's usual wobble
       settle_within: 10W  # settled once settle_frames span no more than this
       settle_within_percent: 3%
-      confirm_frames: 2
-      settle_frames: 4
+      confirm_frames: 2   # 1 s at 500 ms frames
+      settle_frames: 4    # 2 s
       timeout: 10s
     on_load_event:
       - mqtt.publish:

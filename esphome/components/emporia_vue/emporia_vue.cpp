@@ -82,7 +82,11 @@ void EmporiaVueComponent::update() {
   if (this->have_sequence_) {
     // The sequence number is one byte, so count across its wrap.
     uint8_t missed = static_cast<uint8_t>(sensor_reading.sequence_num - this->last_sequence_num_ - 1);
-    if (missed != 0 && missed < 128) {
+    if (missed > 16) {
+      // Too far to be a few dropped frames: the meter chip restarted its count.
+      ESP_LOGW(TAG, "Reading sequence jumped from #%d to #%d; the meter chip may have restarted",
+               this->last_sequence_num_, sensor_reading.sequence_num);
+    } else if (missed != 0) {
       ESP_LOGW(TAG, "Detected %d missing reading(s), data may not be accurate!", missed);
       this->missed_frames_ += missed;
     }
@@ -229,7 +233,7 @@ void CTClampConfig::update_from_reading(const SensorReading &sensor_reading) {
 const LoadEvent *CTClampConfig::detect(uint32_t now) {
   if (this->detector_ == nullptr)
     return nullptr;
-  if (!this->detector_->feed(this->power_now_, power_factor(this->power_now_, this->va_now_), now))
+  if (!this->detector_->feed(this->power_now_, this->va_now_, now))
     return nullptr;
   return &this->detector_->event();
 }
@@ -259,7 +263,7 @@ void CircuitConfig::update_from_clamps() {
 const LoadEvent *CircuitConfig::detect(uint32_t now) {
   if (this->detector_ == nullptr)
     return nullptr;
-  if (!this->detector_->feed(this->power_now_, power_factor(this->power_now_, this->va_now_), now))
+  if (!this->detector_->feed(this->power_now_, this->va_now_, now))
     return nullptr;
   return &this->detector_->event();
 }

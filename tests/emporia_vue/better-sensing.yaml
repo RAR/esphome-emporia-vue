@@ -75,7 +75,7 @@ sensor:
           name: Dryer Current
         power_factor:
           name: Dryer Power Factor
-    load_events:
+    step_detection:
       min_step: 40W
       timeout: 15s
     on_load_event:
