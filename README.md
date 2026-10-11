@@ -65,7 +65,8 @@ external_components:
   node's events from 1 at boot; a gap is an event lost) and `with`: other
   channels whose event began within 700 ms (a 240 V load on both legs, a
   branch step also seen on the mains). `replay_load_events()` sends the last 8
-  again with `"replay":true` — call it when MQTT reconnects, and drop the ones
+  again with `"replay":true`, 2 s later (MQTT's `on_connect` runs before a
+  publish can go out) — call it when MQTT reconnects, and drop the ones
   you already have by `seq`:
 
   ```yaml
@@ -77,11 +78,14 @@ external_components:
   noise, which makes a 50 W load look far less resistive than it is. Each
   clamp learns its noise from frames with next to no power and takes it out of
   its current (in quadrature), so current, apparent power and power factor of
-  small loads read true. `false` keeps the raw current.
+  small loads read true; the mains are left as they are. `false` keeps the
+  raw current.
 - **`unmetered:`** — a detector on what the mains carry that the listed branch
   clamps do not: loads on breakers without a clamp. List every input whose
   breaker is under these mains; events come under `key` (`unmetered`), with a
-  bigger `min_step` (80 W) since the mains read current 4x coarser.
+  bigger `min_step` (80 W) since the mains read current 4x coarser, plus 3% of
+  what the listed clamps carry (their calibration differs from the mains').
+  Check the mains read positive first, and list only clamps under these mains.
 
   ```yaml
   unmetered:

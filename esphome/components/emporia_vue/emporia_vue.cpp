@@ -9,6 +9,10 @@ namespace emporia_vue {
 
 static const char *const TAG = "emporia_vue";
 
+static constexpr uint32_t WITH_WITHIN_MS = 700;      // events this close at their start began together
+static constexpr float UNMETERED_MISMATCH = 0.03f;   // mains vs branch calibration, as a share of what is under
+static constexpr uint32_t REPLAY_AFTER_MS = 2000;    // on_connect fires before publishing works
+
 #if defined(EMPORIA_VUE_VARIANT_VUE3)
 static constexpr float EMPORIA_VUE_FREQUENCY_CONSTANT = 19610.0f;
 #else
@@ -122,12 +126,17 @@ void EmporiaVueComponent::update() {
   }
   if (this->unmetered_ != nullptr) {
     // What the mains carry that no listed branch clamp does: loads on breakers without a clamp.
-    float watts = 0;
+    float watts = 0, under = 0;
     for (auto *ct_clamp : this->ct_clamps_)
       if (ct_clamp->is_mains())
         watts += ct_clamp->get_power();
-    for (auto *ct_clamp : this->unmetered_under_)
+    for (auto *ct_clamp : this->unmetered_under_) {
       watts -= ct_clamp->get_power();
+      under += std::fabs(ct_clamp->get_power());
+    }
+    // The mains and branch clamps differ in calibration by a few percent: a 7 kW charger switching
+    // would otherwise leave a 150 W "step" in the remainder.
+    this->unmetered_->set_extra_threshold(UNMETERED_MISMATCH * under);
     if (this->unmetered_->feed(watts, NAN, now)) {
       do
         this->report_load_event(this->unmetered_->event());
@@ -176,7 +185,6 @@ void EmporiaVueComponent::add_on_load_event_callback(std::function<void(const Lo
   this->load_event_callback_.add(std::move(callback));
 }
 
-static constexpr uint32_t WITH_WITHIN_MS = 700;  // events this close at their start began together
 
 void EmporiaVueComponent::report_load_event(const LoadEvent &event) {
   ESP_LOGD(TAG, "Load event on %s: %.0f W -> %.0f W (peak %.0f W, settled in %u ms)", event.key, event.from_w,
@@ -200,6 +208,12 @@ void EmporiaVueComponent::report_load_event(const LoadEvent &event) {
 }
 
 void EmporiaVueComponent::replay_load_events() {
+  // Called from mqtt on_connect, which runs before the client counts as connected and so before a
+  // publish can go out: wait a moment.
+  this->set_timeout("replay_load_events", REPLAY_AFTER_MS, [this]() { this->replay_now_(); });
+}
+
+void EmporiaVueComponent::replay_now_() {
   ESP_LOGD(TAG, "Replaying the last %u load events", (unsigned) this->sent_n_);
   const uint32_t now = millis();
   for (uint8_t i = 0; i < this->sent_n_; i++) {
@@ -215,7 +229,8 @@ void EmporiaVueComponent::add_on_update_callback(std::function<void()> &&callbac
 }
 
 static constexpr float CURRENT_FLOOR_IDLE_W = 3.0f;   // below this a frame's current is the clamp's noise
-static constexpr uint32_t CURRENT_FLOOR_FRAMES = 60;  // idle frames seen before the floor is taken out
+static constexpr uint32_t CURRENT_FLOOR_FRAMES = 60;  // idle frames learned from before the floor is taken out
+static constexpr uint32_t CURRENT_FLOOR_RUN = 10;     // idle frames in a row before any is learned from
 
 static inline bool is_mains_port(CTInputPort port) {
   return port == CTInputPort::A || port == CTInputPort::B || port == CTInputPort::C;
@@ -275,12 +290,18 @@ void CTClampConfig::update_from_reading(const SensorReading &sensor_reading) {
     scalar = 775.0 / 170496.0;
   }
   float amps = raw_current * scalar;
-  if (this->current_floor_) {
-    // With next to no power through it, what the clamp reads is its noise: learn its square, and take it
-    // out in quadrature (noise adds to a load's current as RMS does), once it has been seen for long enough.
+  if (this->current_floor_ && !is_mains_port(this->input_port_)) {
+    // With next to no power through it for a while, what the clamp reads is its noise: learn its square,
+    // and take it out in quadrature (noise adds to a load's current as RMS does), once it has been seen for
+    // long enough. Only from a run of idle frames, not a passing zero crossing of a changing load. (The
+    // mains read current 4x coarser and are seldom idle: left as they are.)
     if (std::fabs(this->power_now_) < CURRENT_FLOOR_IDLE_W) {
-      this->floor_sq_ += (amps * amps - this->floor_sq_) / (this->floor_n_ < 50 ? this->floor_n_ + 1 : 50);
-      this->floor_n_++;
+      if (++this->idle_run_ >= CURRENT_FLOOR_RUN) {
+        this->floor_sq_ += (amps * amps - this->floor_sq_) / (this->floor_n_ < 50 ? this->floor_n_ + 1 : 50);
+        this->floor_n_++;
+      }
+    } else {
+      this->idle_run_ = 0;
     }
     if (this->floor_n_ >= CURRENT_FLOOR_FRAMES)
       amps = std::sqrt(std::max(amps * amps - this->floor_sq_, 0.0f));

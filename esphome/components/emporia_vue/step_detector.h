@@ -100,7 +100,7 @@ struct LoadEvent {
   std::string to_json(uint32_t now_ms) const {
     std::string out;
     out.reserve(360 + 7 * this->count);
-    char buf[64];
+    char buf[96];
     auto num = [&](const char *name, float v, const char *fmt) {
       if (std::isnan(v)) {
         snprintf(buf, sizeof(buf), ",\"%s\":null", name);
@@ -203,6 +203,9 @@ class StepDetector {
     return true;
   }
   bool cycling() const { return this->cycling_; }
+  // Watts a step must also clear, set each frame by the caller (a remainder's calibration mismatch
+  // grows with what it is the remainder of).
+  void set_extra_threshold(float w) { this->extra_w_ = w; }
   float level() const { return this->base_; }
   float noise() const { return this->noise_; }
 
@@ -284,12 +287,12 @@ class StepDetector {
     float wobble = this->cfg_.noise_factor * this->noise_;
     if (this->cfg_.max_noise_w > 0)
       wobble = std::min(wobble, std::max(this->cfg_.max_noise_w, 1.5f * this->noise_));
-    return std::max({this->cfg_.min_step_w, this->cfg_.rel_step * smaller, wobble});
+    return std::max({this->cfg_.min_step_w, this->cfg_.rel_step * smaller, wobble, this->extra_w_});
   }
   // What a slow average must move to be reported: twice a step by the level alone, without the wobble,
   // so steady creep the anchor lags behind does not come out as a stream of minimum-sized changes.
   float drift_threshold(float level, float w) const {
-    return 2.0f * std::max(this->cfg_.min_step_w, this->cfg_.rel_step * std::min(std::fabs(level), std::fabs(w)));
+    return 2.0f * std::max({this->cfg_.min_step_w, this->cfg_.rel_step * std::min(std::fabs(level), std::fabs(w)), this->extra_w_});
   }
 
   // The level an event left: where gradual change is measured from.
@@ -777,6 +780,7 @@ class StepDetector {
   float base_{0};
   float base_va_{NAN};
   float noise_{0};
+  float extra_w_{0};
   float slow_{0}, slow_va_{NAN};          // the slow average of every frame
   float anchor_w_{0}, anchor_va_{NAN};    // the level the last event left
   uint8_t drift_n_{0};                    // frames the slow average has been a step away from it

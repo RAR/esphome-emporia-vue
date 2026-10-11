@@ -126,6 +126,7 @@ class EmporiaVueComponent : public PollingComponent, public i2c::I2CDevice {
   std::vector<CircuitConfig *> circuits_;
   CallbackManager<void()> callback_;
   CallbackManager<void(const LoadEvent &)> load_event_callback_;
+  void replay_now_();
   static constexpr uint8_t REPLAY = 8;
   LoadEvent sent_[REPLAY];                // the last events reported, oldest overwritten
   uint8_t sent_head_{0}, sent_n_{0};
@@ -255,6 +256,7 @@ class CTClampConfig : public sensor::Sensor {
   bool current_floor_{true};
   float floor_sq_{0};        // the noise floor's square (A^2), learned from frames with next to no power
   uint32_t floor_n_{0};
+  uint32_t idle_run_{0};
   float power_now_{NAN}, current_now_{NAN}, va_now_{NAN};
   Averaged power_;
   Averaged current_;
