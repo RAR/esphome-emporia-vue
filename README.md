@@ -34,7 +34,7 @@ external_components:
 - **Load events** — every branch clamp and circuit is watched frame by frame
   for steps: a load switching on or off. Each finished step fires
   `on_load_event` with `event`; `event.json()` gives
-  `{"key","age_ms","from_w","to_w","peak_w","va_from","va_to","pf_from","pf_to","noise_w","settle_ms","settled","pulse","drift","dt_ms","samples"}`
+  `{"key","age_ms","from_w","to_w","peak_w","va_from","va_to","pf_from","pf_to","noise_w","settle_ms","settled","pulse","drift","held_w","held_span_w","held_ms","stages","dt_ms","samples"}`
   — where it was, where it went, its inrush peak, the apparent power and
   power factor either side (the load's own reactive part is
   √(va²−w²) to minus from), the level's usual wobble, how long it took to
@@ -49,6 +49,18 @@ external_components:
   `drift_frames`: `drift: true`, from and to are averages, and it is dated
   from when the change began. Change slower than about 5 minutes (a heater
   sagging as it warms) is followed, not reported.
+  Every event also gives the stretch it ended (`held_w` its mean, `held_ms`,
+  `held_span_w` its max minus min), so a load that varies while on is
+  measured by what it drew, and `stages`: levels the step passed through for
+  two frames or more on the way (`[[270,3]]` — a PC waking, then its screen).
+  A load switching on and off over and over (a 3D printer's bed, a bang-bang
+  element) is reported once it has made `cycle_steps` alternating steps alike
+  in size between the same two levels within `cycle_window`: one event with
+  `"cycling":"start"` (from its low level to its mean so far; `spans_ms` back
+  to its first switch, which were already reported) and one with
+  `"cycling":"end"` (from its mean, `held_w`, to the level after), each with
+  `amp_w`, `period_ms` and `duty`. The switches between are not reported. A
+  step that does not fit (another load switching) ends it and is reported.
   Mains clamps and clamps inside a circuit are not watched unless they say
   `load_events: true`; any can say `load_events: false`. The key is the power
   sensor's name without "Power" (`Hot Tub Power` → `hot_tub`), or `key:`.
@@ -91,6 +103,9 @@ sensor:
       settle_frames: 4    # 2 s
       timeout: 10s
       drift_frames: 20    # a gradual change held this long (10 s) is reported; 0 never
+      cycle_steps: 4      # alternating steps alike in size that make a cycling load; 0 never
+      cycle_tolerance: 35%
+      cycle_window: 60s
     on_load_event:
       - mqtt.publish:
           topic: my-vue/load_event

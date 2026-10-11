@@ -43,6 +43,12 @@ struct StepConfig {
   // whose wobble hides it) is reported once a slow average has stayed a step away from the level the
   // last event left for this many frames; 0 never.
   uint8_t drift_frames = 20;
+  // A load switching on and off over and over (a 3D printer's bed, a bang-bang element) is reported as
+  // one cycling event at its start and one at its end, not every switch: once this many steps in a row
+  // alternate up and down, alike within cycle_tolerance of their size, within cycle_window_ms. 0 never.
+  uint8_t cycle_steps = 4;
+  float cycle_tolerance = 0.35f;
+  uint32_t cycle_window_ms = 60000;
 };
 
 struct LoadEvent {
@@ -58,6 +64,20 @@ struct LoadEvent {
   bool settled{false};             // false when it timed out still moving
   bool pulse{false};               // it came back to where it was: an inrush or a brief load
   bool drift{false};               // a gradual change, not a step: from and to are slow averages
+  // The stretch this event ended: its mean, how long, and its span (max - min), from the last event on.
+  float held_w{NAN}, held_span_w{NAN};
+  uint32_t held_ms{0};
+  // Levels it passed through on the way, held for two frames or more (a load's stages): [w, frames].
+  static constexpr uint8_t MAX_STAGES = 3;
+  uint8_t stage_count{0};
+  float stage_w[MAX_STAGES]{};
+  uint8_t stage_frames[MAX_STAGES]{};
+  // Cycling: 0 not, 1 its start (from the low level to its mean so far), 2 its end (from its mean to
+  // the level after). With the swing, the time from one switch on to the next, the share of that on,
+  // and (at the start) how long since the first switch, so the switches already reported can be set aside.
+  uint8_t cycling{0};
+  float amp_w{NAN}, duty{NAN};
+  uint32_t period_ms{0}, spans_ms{0};
   uint32_t first_ms{0}, last_ms{0};  // the first and last stored samples
   uint32_t reported_ms{0};           // when it was handed on (set by the component)
   uint8_t count{0};
@@ -71,7 +91,7 @@ struct LoadEvent {
 
   std::string to_json(uint32_t now_ms) const {
     std::string out;
-    out.reserve(220 + 7 * this->count);
+    out.reserve(360 + 7 * this->count);
     char buf[64];
     auto num = [&](const char *name, float v, const char *fmt) {
       if (std::isnan(v)) {
@@ -102,6 +122,23 @@ struct LoadEvent {
     snprintf(buf, sizeof(buf), ",\"settle_ms\":%u,\"settled\":%s,\"pulse\":%s,\"drift\":%s", (unsigned) this->settle_ms,
              this->settled ? "true" : "false", this->pulse ? "true" : "false", this->drift ? "true" : "false");
     out += buf;
+    num("held_w", this->held_w, "%.1f");
+    num("held_span_w", this->held_span_w, "%.1f");
+    snprintf(buf, sizeof(buf), ",\"held_ms\":%u,\"stages\":[", (unsigned) this->held_ms);
+    out += buf;
+    for (uint8_t i = 0; i < this->stage_count; i++) {
+      snprintf(buf, sizeof(buf), i ? ",[%.0f,%u]" : "[%.0f,%u]", this->stage_w[i], (unsigned) this->stage_frames[i]);
+      out += buf;
+    }
+    out += ']';
+    if (this->cycling) {
+      snprintf(buf, sizeof(buf), ",\"cycling\":\"%s\"", this->cycling == 1 ? "start" : "end");
+      out += buf;
+      num("amp_w", this->amp_w, "%.1f");
+      num("duty", this->duty, "%.2f");
+      snprintf(buf, sizeof(buf), ",\"period_ms\":%u,\"spans_ms\":%u", (unsigned) this->period_ms, (unsigned) this->spans_ms);
+      out += buf;
+    }
     unsigned dt = this->count > 1 ? (unsigned) ((this->last_ms - this->first_ms) / (this->count - 1)) : 0;
     snprintf(buf, sizeof(buf), ",\"dt_ms\":%u,\"samples\":[", dt);
     out += buf;
@@ -120,24 +157,52 @@ class StepDetector {
   static constexpr uint8_t WINDOW = 8;  // the most frames the settle check looks back over
   static constexpr float DRIFT_GAIN = 0.1f;      // the slow average's weight on each frame (~10 frames)
   static constexpr float ANCHOR_GAIN = 1 / 600.0f;  // the anchor follows change slower than ~600 frames (5 min)
+  static constexpr uint8_t HISTORY = 8;             // the most steps kept to see a load cycling
 
   explicit StepDetector(const char *key = "", StepConfig cfg = {}) : cfg_(cfg) {
     this->event_.key = key;
     this->event_.min_va = this->cfg_.min_va;
+    this->cyc_event_.key = key;
+    this->cyc_event_.min_va = this->cfg_.min_va;
+    this->cfg_.cycle_steps = std::min<uint8_t>(this->cfg_.cycle_steps, HISTORY);
     this->cfg_.settle_frames = std::max<uint8_t>(2, std::min<uint8_t>(this->cfg_.settle_frames, WINDOW));
     this->cfg_.confirm = std::max<uint8_t>(1, std::min<uint8_t>(this->cfg_.confirm, WINDOW));
   }
 
   const StepConfig &config() const { return this->cfg_; }
-  const LoadEvent &event() const { return this->event_; }
+  // The event feed() reported; next() moves on to a second from the same frame (a cycling load's end,
+  // then the step that ended it), false when there is none.
+  const LoadEvent &event() const { return *this->out_[this->out_i_]; }
+  bool next() {
+    if (this->out_i_ + 1 >= this->out_n_)
+      return false;
+    this->out_i_++;
+    return true;
+  }
+  bool cycling() const { return this->cycling_; }
   float level() const { return this->base_; }
   float noise() const { return this->noise_; }
 
-  // Feed one frame (real power, apparent power or NAN); true when a step has
-  // just finished (read it from event()).
+  // Feed one frame (real power, apparent power or NAN); true when an event is
+  // ready (read it from event(), then next() for any second one).
   bool feed(float w, float va, uint32_t ms) {
+    this->out_n_ = this->out_i_ = 0;
     if (std::isnan(w))
       return false;
+    if (this->cycling_) {
+      this->cyc_sum_ += w;
+      this->cyc_n_++;
+    }
+    if (this->step(w, va, ms))
+      this->route(ms);
+    else if (this->cycling_)
+      this->cycle_idle(ms);
+    return this->out_n_ > 0;
+  }
+
+ protected:
+  // The step detector itself: true when a step (or a gradual change) has finished, in event_.
+  bool step(float w, float va, uint32_t ms) {
     if (!this->primed_) {
       this->primed_ = true;
       this->base_ = w;
@@ -159,6 +224,12 @@ class StepDetector {
         if (!std::isnan(va))
           this->base_va_ = std::isnan(this->base_va_) ? va : this->base_va_ + 0.25f * (va - this->base_va_);
         this->remember(w, va, ms);
+        this->held_add(w, ms);
+        if (this->cycling_) {
+          // A cycling load's mean moves as its duty does: that is not a change to report.
+          this->anchor(this->slow_, this->slow_va_);
+          return false;
+        }
         return this->drifted(ms);
       }
       // Away from the level: wait for `confirm` frames in a row before calling it a step.
@@ -174,7 +245,6 @@ class StepDetector {
     return this->check(ms);
   }
 
- protected:
   // How far a frame must be from the level to count: symmetric, so a load
   // switching on and the same load switching off are both seen.
   float threshold(float level, float w) const {
@@ -243,6 +313,8 @@ class StepDetector {
     e.settled = false;
     e.pulse = false;
     e.drift = true;
+    e.stage_count = 0;
+    this->held_fill(e, this->drift_ms_);
     e.count = 0;
     for (uint8_t i = 0; i < this->pre_n_; i++) {
       uint8_t at = (this->pre_head_ + PRE - this->pre_n_ + i) % PRE;
@@ -277,6 +349,7 @@ class StepDetector {
     e.peak_w = this->base_;
     e.start_ms = this->pend_ms_[0];
     e.drift = false;
+    this->held_fill(e, e.start_ms);
     e.count = 0;
     for (uint8_t i = 0; i < this->pre_n_; i++) {
       uint8_t at = (this->pre_head_ + PRE - this->pre_n_ + i) % PRE;
@@ -291,6 +364,7 @@ class StepDetector {
     this->win_n_ = 0;
     uint8_t n = this->pending_;
     this->pending_ = 0;
+    this->lead_ = e.count;
     for (uint8_t i = 0; i < n; i++)
       this->capture(this->pend_w_[i], this->pend_va_[i], this->pend_ms_[i]);
   }
@@ -309,6 +383,227 @@ class StepDetector {
     this->win_ms_[at] = ms;
     this->win_head_ = (at + 1) % WINDOW;
     this->win_n_ = std::min<uint8_t>(this->win_n_ + 1, WINDOW);
+  }
+
+  // --- the stretch between events -------------------------------------------
+
+  void held_add(float w, uint32_t ms) {
+    if (this->held_n_ == 0) {
+      this->held_ms_ = ms;
+      this->held_lo_ = this->held_hi_ = w;
+      this->held_sum_ = 0;
+    }
+    this->held_sum_ += w;
+    this->held_n_++;
+    this->held_lo_ = std::min(this->held_lo_, w);
+    this->held_hi_ = std::max(this->held_hi_, w);
+  }
+  void held_fill(LoadEvent &e, uint32_t end_ms) {
+    e.held_w = this->held_n_ ? this->held_sum_ / this->held_n_ : NAN;
+    e.held_span_w = this->held_n_ ? this->held_hi_ - this->held_lo_ : NAN;
+    e.held_ms = this->held_n_ ? end_ms - this->held_ms_ : 0;
+    this->held_n_ = 0;
+  }
+
+  // Levels the step passed through for two frames or more, between where it started and where it settled.
+  void stages(LoadEvent &e, uint8_t settled_frames) {
+    e.stage_count = 0;
+    int end = (int) e.count - settled_frames;
+    float run_sum = 0;
+    uint8_t run_n = 0;
+    auto close = [&]() {
+      if (run_n >= 2 && e.stage_count < LoadEvent::MAX_STAGES) {
+        float m = run_sum / run_n;
+        if (std::fabs(m - e.from_w) > this->tolerance(e.from_w) && std::fabs(m - e.to_w) > this->tolerance(e.to_w)) {
+          e.stage_w[e.stage_count] = m;
+          e.stage_frames[e.stage_count++] = run_n;
+        }
+      }
+      run_sum = 0;
+      run_n = 0;
+    };
+    for (int i = this->lead_; i < end; i++) {
+      float s = e.samples[i];
+      if (run_n && std::fabs(s - run_sum / run_n) > this->tolerance(run_sum / run_n))
+        close();
+      run_sum += s;
+      run_n++;
+    }
+    close();
+  }
+
+  // --- cycling ----------------------------------------------------------------
+
+  void push(const LoadEvent *e) {
+    if (this->out_n_ < 2)
+      this->out_[this->out_n_++] = e;
+  }
+
+  // What to report of a step just found: itself, or nothing while a cycling load goes on switching,
+  // or a cycling load's end and then the step that ended it, or the step and then cycling's start.
+  void route(uint32_t ms) {
+    LoadEvent &e = this->event_;
+    e.cycling = 0;
+    if (e.drift) {
+      this->push(&e);
+      return;
+    }
+    if (this->cycling_) {
+      if (e.pulse)
+        return;
+      if (this->fits(e)) {
+        this->toggle(e);
+        return;
+      }
+      this->end_cycle(e.from_w, e.start_ms);
+      this->push(&e);
+      this->remember_step(e);
+      return;
+    }
+    this->push(&e);
+    if (e.pulse)
+      return;
+    this->remember_step(e);
+    if (this->cfg_.cycle_steps >= 2 && this->cycles())
+      this->begin_cycle(ms);
+  }
+
+  void remember_step(const LoadEvent &e) {
+    if (this->hist_n_ == HISTORY) {
+      for (uint8_t i = 1; i < HISTORY; i++) {
+        this->hist_ms_[i - 1] = this->hist_ms_[i];
+        this->hist_dw_[i - 1] = this->hist_dw_[i];
+        this->hist_low_[i - 1] = this->hist_low_[i];
+      }
+      this->hist_n_--;
+    }
+    this->hist_ms_[this->hist_n_] = e.start_ms;
+    this->hist_dw_[this->hist_n_] = e.to_w - e.from_w;
+    this->hist_low_[this->hist_n_++] = std::min(e.from_w, e.to_w);
+  }
+
+  // The last cycle_steps steps alternate up and down, alike in size, within the window.
+  bool cycles() const {
+    const uint8_t n = this->cfg_.cycle_steps;
+    if (this->hist_n_ < n)
+      return false;
+    const uint8_t first = this->hist_n_ - n;
+    if (this->hist_ms_[this->hist_n_ - 1] - this->hist_ms_[first] > this->cfg_.cycle_window_ms)
+      return false;
+    float size = 0;
+    for (uint8_t i = first; i < this->hist_n_; i++) {
+      if (i > first && (this->hist_dw_[i] > 0) == (this->hist_dw_[i - 1] > 0))
+        return false;
+      size += std::fabs(this->hist_dw_[i]);
+    }
+    size /= n;
+    float low = this->hist_low_[this->hist_n_ - 1];
+    for (uint8_t i = first; i < this->hist_n_; i++) {
+      if (std::fabs(std::fabs(this->hist_dw_[i]) - size) > this->cfg_.cycle_tolerance * size)
+        return false;
+      // ...and all between the same two levels (not a load switching on as the cycling one does).
+      if (std::fabs(this->hist_low_[i] - low) > std::max(this->cfg_.min_step_w, 0.15f * size))
+        return false;
+    }
+    return true;
+  }
+
+  void begin_cycle(uint32_t ms) {
+    const uint8_t n = this->cfg_.cycle_steps, first = this->hist_n_ - n;
+    this->cycling_ = true;
+    this->cyc_low_ = this->hist_low_[this->hist_n_ - 1];
+    this->cyc_amp_ = 0;
+    this->cyc_high_ms_ = this->cyc_total_ms_ = 0;
+    for (uint8_t i = first; i < this->hist_n_; i++) {
+      this->cyc_amp_ += std::fabs(this->hist_dw_[i]) / n;
+      if (i + 1 < this->hist_n_) {
+        uint32_t gap = this->hist_ms_[i + 1] - this->hist_ms_[i];
+        this->cyc_total_ms_ += gap;
+        if (this->hist_dw_[i] > 0)
+          this->cyc_high_ms_ += gap;
+      }
+    }
+    this->cyc_toggles_ = n - 1;
+    this->cyc_start_ms_ = this->hist_ms_[first];
+    this->last_toggle_ms_ = this->hist_ms_[this->hist_n_ - 1];
+    this->last_up_ = this->hist_dw_[this->hist_n_ - 1] > 0;
+    this->cyc_sum_ = 0;
+    this->cyc_n_ = 0;
+    LoadEvent &c = this->cycle_event(1, this->cyc_low_, this->cyc_low_ + this->cyc_amp_ * this->duty_now(), this->cyc_start_ms_);
+    c.spans_ms = ms - this->cyc_start_ms_;
+    this->push(&c);
+  }
+
+  // A step that carries the cycling on: the other way from the last, about its size, and landing back on
+  // the cycle's low or high level. Anything else (another load switching as the cycling one does) ends it.
+  bool fits(const LoadEvent &e) const {
+    float dw = e.to_w - e.from_w;
+    if ((dw > 0) == this->last_up_ || std::fabs(std::fabs(dw) - this->cyc_amp_) > this->cfg_.cycle_tolerance * this->cyc_amp_)
+      return false;
+    float level = dw > 0 ? this->cyc_low_ + this->cyc_amp_ : this->cyc_low_;
+    return std::fabs(e.to_w - level) <= std::max(this->cfg_.min_step_w, 0.15f * this->cyc_amp_);
+  }
+
+  void toggle(const LoadEvent &e) {
+    uint32_t gap = e.start_ms - this->last_toggle_ms_;
+    this->cyc_total_ms_ += gap;
+    if (this->last_up_)
+      this->cyc_high_ms_ += gap;
+    this->cyc_toggles_++;
+    this->last_toggle_ms_ = e.start_ms;
+    this->last_up_ = !this->last_up_;
+    if (!this->last_up_)
+      this->cyc_low_ += 0.25f * (e.to_w - this->cyc_low_);
+    this->cyc_amp_ += 0.2f * (std::fabs(e.to_w - e.from_w) - this->cyc_amp_);
+  }
+
+  // Off at the low level, and no switch for three of its usual gaps (or a timeout): it has stopped.
+  // On at the high level it is still going, however long (a bed holding full power).
+  void cycle_idle(uint32_t ms) {
+    if (this->last_up_)
+      return;
+    uint32_t usual = this->cyc_toggles_ ? this->cyc_total_ms_ / this->cyc_toggles_ : 0;
+    if (ms - this->last_toggle_ms_ > std::max<uint32_t>(3 * usual, this->cfg_.timeout_ms))
+      this->end_cycle(this->base_, this->last_toggle_ms_);
+  }
+
+  void end_cycle(float to_w, uint32_t at_ms) {
+    float mean = this->cyc_n_ ? this->cyc_sum_ / this->cyc_n_ : this->cyc_low_ + this->cyc_amp_ * this->duty_now();
+    LoadEvent &c = this->cycle_event(2, mean, to_w, at_ms);
+    c.held_w = mean;
+    c.held_span_w = this->cyc_amp_;
+    c.held_ms = at_ms - this->cyc_start_ms_;
+    this->push(&c);
+    this->cycling_ = false;
+    this->hist_n_ = 0;
+    this->held_n_ = 0;
+    this->anchor(this->base_, this->base_va_);
+  }
+
+  float duty_now() const { return this->cyc_total_ms_ ? (float) this->cyc_high_ms_ / this->cyc_total_ms_ : 0.5f; }
+
+  LoadEvent &cycle_event(uint8_t kind, float from_w, float to_w, uint32_t start_ms) {
+    LoadEvent &c = this->cyc_event_;
+    c.cycling = kind;
+    c.from_w = from_w;
+    c.to_w = to_w;
+    c.peak_w = this->cyc_low_ + this->cyc_amp_;
+    c.va_from = c.va_to = NAN;  // a switching load's apparent power averages to nothing useful
+    c.noise_w = this->noise_;
+    c.start_ms = start_ms;
+    c.settle_ms = 0;
+    c.settled = true;
+    c.pulse = c.drift = false;
+    c.held_w = c.held_span_w = NAN;
+    c.held_ms = 0;
+    c.stage_count = 0;
+    c.count = 0;
+    c.first_ms = c.last_ms = start_ms;
+    c.amp_w = this->cyc_amp_;
+    c.duty = this->duty_now();
+    c.period_ms = this->cyc_toggles_ ? 2 * this->cyc_total_ms_ / this->cyc_toggles_ : 0;
+    c.spans_ms = 0;
+    return c;
   }
 
   // How many times the last `n` captured frames turned back (rising then falling, or the reverse).
@@ -356,6 +651,7 @@ class StepDetector {
     e.settled = settled;
     e.pulse = std::fabs(mean - e.from_w) < this->threshold(e.from_w, mean);
     e.settle_ms = this->win_ms_[this->recent(0, have)] - e.start_ms;
+    this->stages(e, have);
     // The settled frames are the new level and lead into the next step.
     this->base_ = mean;
     if (va_n)
@@ -379,6 +675,18 @@ class StepDetector {
 
   StepConfig cfg_;
   LoadEvent event_;
+  LoadEvent cyc_event_;
+  const LoadEvent *out_[2]{&event_, &event_};
+  uint8_t out_n_{0}, out_i_{0};
+  uint8_t lead_{0};                        // frames before the step at the head of its samples
+  float held_sum_{0}, held_lo_{0}, held_hi_{0};
+  uint32_t held_n_{0}, held_ms_{0};
+  uint32_t hist_ms_[HISTORY]{};
+  float hist_dw_[HISTORY]{}, hist_low_[HISTORY]{};
+  uint8_t hist_n_{0};
+  bool cycling_{false}, last_up_{false};
+  float cyc_low_{0}, cyc_amp_{0}, cyc_sum_{0};
+  uint32_t cyc_n_{0}, cyc_start_ms_{0}, last_toggle_ms_{0}, cyc_high_ms_{0}, cyc_total_ms_{0}, cyc_toggles_{0};
   bool primed_{false};
   bool moving_{false};
   float base_{0};

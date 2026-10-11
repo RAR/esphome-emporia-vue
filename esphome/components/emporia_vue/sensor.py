@@ -60,6 +60,9 @@ CONF_CONFIRM_FRAMES = "confirm_frames"
 CONF_SETTLE_FRAMES = "settle_frames"
 CONF_MAX_NOISE = "max_noise"
 CONF_DRIFT_FRAMES = "drift_frames"
+CONF_CYCLE_STEPS = "cycle_steps"
+CONF_CYCLE_TOLERANCE = "cycle_tolerance"
+CONF_CYCLE_WINDOW = "cycle_window"
 CONF_TIMEOUT = "timeout"
 
 CODEOWNERS = ["@flaviut", "@Maelstrom96", "@krconv"]
@@ -180,6 +183,14 @@ SCHEMA_STEP_DETECTION = cv.Schema(
         cv.Optional(CONF_MAX_NOISE, default="0W"): watts,
         # Frames a gradual change must hold before it is reported (about 10 s on a Vue 3); 0 never.
         cv.Optional(CONF_DRIFT_FRAMES, default=20): cv.int_range(min=0, max=120),
+        # A load switching on and off over and over is one cycling start and end: once this many steps
+        # in a row alternate, alike within cycle_tolerance, within cycle_window. 0 never.
+        cv.Optional(CONF_CYCLE_STEPS, default=4): cv.Any(cv.one_of(0, int=True), cv.int_range(min=3, max=8)),
+        cv.Optional(CONF_CYCLE_TOLERANCE, default="35%"): cv.percentage,
+        cv.Optional(CONF_CYCLE_WINDOW, default="60s"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(min=cv.TimePeriod(seconds=5), max=cv.TimePeriod(minutes=10)),
+        ),
         cv.Optional(CONF_SETTLE_WITHIN, default="10W"): watts,
         cv.Optional(CONF_SETTLE_WITHIN_PERCENT, default="3%"): cv.percentage,
         cv.Optional(CONF_CONFIRM_FRAMES, default=2): cv.int_range(min=1, max=8),
@@ -421,6 +432,9 @@ async def to_code(config):
         ("settle_frames", events[CONF_SETTLE_FRAMES]),
         ("timeout_ms", events[CONF_TIMEOUT].total_milliseconds),
         ("drift_frames", events[CONF_DRIFT_FRAMES]),
+        ("cycle_steps", events[CONF_CYCLE_STEPS]),
+        ("cycle_tolerance", events[CONF_CYCLE_TOLERANCE]),
+        ("cycle_window_ms", events[CONF_CYCLE_WINDOW].total_milliseconds),
     )
 
     in_circuit = {str(inp) for c in config.get(CONF_CIRCUITS, []) for inp in c[CONF_INPUTS]}

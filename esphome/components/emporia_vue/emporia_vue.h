@@ -221,6 +221,7 @@ class CTClampConfig : public sensor::Sensor {
   float get_calibrated_power(int32_t raw_power) const;
   // A frame's step, if this clamp watches for them and one just finished.
   const LoadEvent *detect(uint32_t now);
+  const LoadEvent *detect_more();  // a second event from the same frame, or null
   void flush();
 
   // The last frame, for circuits made of several clamps.
@@ -266,6 +267,7 @@ class CircuitConfig {
 
   void update_from_clamps();
   const LoadEvent *detect(uint32_t now);
+  const LoadEvent *detect_more();  // a second event from the same frame, or null
   void flush();
 
  protected:

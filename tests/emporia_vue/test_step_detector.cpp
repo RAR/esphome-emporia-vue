@@ -23,7 +23,7 @@ static int failures = 0;
     }                                                                \
   } while (0)
 
-#define NEAR(a, b, tol) CHECK(std::fabs((a) - (b)) <= (tol))
+#define NEAR(a, b, tol) CHECK(std::fabs((double) (a) - (double) (b)) <= (tol))
 
 static constexpr uint32_t FRAME_MS = 200;
 
@@ -36,8 +36,11 @@ struct Run {
   // pf gives each frame an apparent power of w / pf.
   void feed(std::vector<float> ws, float pf = NAN) {
     for (float w : ws) {
-      if (det.feed(w, std::isnan(pf) ? NAN : w / pf, ms))
+      if (det.feed(w, std::isnan(pf) ? NAN : w / pf, ms)) {
         events.push_back(det.event());
+        while (det.next())
+          events.push_back(det.event());
+      }
       ms += FRAME_MS;
     }
   }
@@ -284,6 +287,88 @@ static void a_load_is_seen_switching_off_a_busy_circuit_as_it_was_switching_on()
   CHECK(r.events.size() == 2);
 }
 
+
+// A 3D printer's bed: 265 W on for 2 s, off for 3 s (frames 200 ms apart), over a 250 W circuit.
+static void bed(Run &r, int frames, float base = 250) {
+  for (int i = 0; i < frames; i++)
+    r.feed({((i % 25) < 10 ? base + 265 : base) + ((i % 2) ? 3.0f : -3.0f)}, 0.99f);
+}
+
+static void a_cycling_load_is_one_start_and_one_end() {
+  Run r;
+  r.hold(250, 30, 0.99f, 3);
+  bed(r, 1500);                              // 5 minutes
+  r.hold(250, 100, 0.99f, 3);
+  int starts = 0, ends = 0, steps = 0;
+  const LoadEvent *start = nullptr, *end = nullptr;
+  for (auto &e : r.events) {
+    if (e.cycling == 1) { starts++; start = &e; }
+    else if (e.cycling == 2) { ends++; end = &e; }
+    else steps++;
+  }
+  std::printf("  %d steps, %d start, %d end\n", steps, starts, ends);
+  CHECK(starts == 1 && ends == 1 && steps <= 4);   // only the switches before it was recognised
+  if (!start || !end)
+    return;
+  NEAR(start->from_w, 250, 8);
+  CHECK(start->spans_ms > 0 && start->spans_ms < 30000);
+  NEAR(start->amp_w, 265, 15);
+  NEAR(end->held_w, 250 + 265 * 0.4f, 15);   // its true mean: on 40 % of the time
+  NEAR(end->duty, 0.4f, 0.08f);
+  NEAR(end->period_ms, 5000, 500);
+  NEAR(end->to_w, 250, 8);
+  CHECK(end->json().find("\"cycling\":\"end\"") != std::string::npos);
+}
+
+static void another_load_switching_mid_cycle_is_still_reported() {
+  Run r;
+  r.hold(250, 30, 0.99f, 3);
+  bed(r, 500);
+  r.hold(250, 10, 0.99f, 3);                 // the bed off for a moment...
+  r.hold(370, 10, 0.99f, 3);                 // ...as a 120 W PC comes on
+  bed(r, 500, 370);
+  r.hold(370, 100, 0.99f, 3);
+  bool ended = false, pc = false;
+  int starts = 0;
+  for (auto &e : r.events) {
+    if (e.cycling == 2)
+      ended = true;
+    if (e.cycling == 1)
+      starts++;
+    if (!e.cycling && std::fabs(e.from_w - 250) < 10 && std::fabs(e.to_w - 370) < 10)
+      pc = true;
+  }
+  CHECK(ended && pc && starts == 2);
+}
+
+static void long_runs_are_never_cycling() {
+  Run r;
+  for (int k = 0; k < 6; k++) {              // a hot tub heater: 27 minutes on, then off
+    r.hold(46, 300, 0.98f, 1);
+    r.hold(957, 300, 1.0f, 2);
+  }
+  for (auto &e : r.events)
+    CHECK(e.cycling == 0);
+}
+
+static void a_step_reports_the_stretch_it_ended_and_its_stages() {
+  Run r;
+  r.hold(226, 30, 0.95f, 2);
+  r.hold(270, 3, 0.95f, 1);                  // a PC waking: +44 W, then its screen +124 W
+  r.hold(394, 30, 0.95f, 2);
+  CHECK(r.events.size() == 1);
+  if (r.events.empty())
+    return;
+  const LoadEvent &e = r.events[0];
+  NEAR(e.held_w, 226, 3);
+  NEAR(e.held_ms, 30 * FRAME_MS, 2 * FRAME_MS);
+  CHECK(e.held_span_w < 10);
+  CHECK(e.stage_count == 1);
+  if (e.stage_count)
+    NEAR(e.stage_w[0], 270, 5);
+  CHECK(e.json().find("\"stages\":[[270,") != std::string::npos);
+}
+
 int main() {
   struct {
     const char *name;
@@ -297,6 +382,10 @@ int main() {
       {"a load switching off a jittery circuit is still seen", a_load_switching_off_a_jittery_circuit_is_still_seen},
       {"a ramp is not learned as wobble", a_ramp_is_not_learned_as_wobble},
       {"steady creep is not a stream of small changes", steady_creep_is_not_a_stream_of_small_changes},
+      {"a cycling load is one start and one end", a_cycling_load_is_one_start_and_one_end},
+      {"another load switching mid-cycle is still reported", another_load_switching_mid_cycle_is_still_reported},
+      {"long runs are never cycling", long_runs_are_never_cycling},
+      {"a step reports the stretch it ended and its stages", a_step_reports_the_stretch_it_ended_and_its_stages},
       {"a brief load comes back as a pulse", a_brief_load_comes_back_as_a_pulse},
       {"a load that never settles is reported when it times out", a_load_that_never_settles_is_reported_when_it_times_out},
       {"steps follow on from each other", steps_follow_on_from_each_other},

@@ -105,12 +105,18 @@ void EmporiaVueComponent::update() {
     circuit->update_from_clamps();
   }
   for (auto *ct_clamp : this->ct_clamps_) {
-    if (const LoadEvent *event = ct_clamp->detect(now))
+    if (const LoadEvent *event = ct_clamp->detect(now)) {
       this->report_load_event(*event);
+      while ((event = ct_clamp->detect_more()) != nullptr)
+        this->report_load_event(*event);
+    }
   }
   for (auto *circuit : this->circuits_) {
-    if (const LoadEvent *event = circuit->detect(now))
+    if (const LoadEvent *event = circuit->detect(now)) {
       this->report_load_event(*event);
+      while ((event = circuit->detect_more()) != nullptr)
+        this->report_load_event(*event);
+    }
   }
 
   if (this->publish_interval_ms_ == 0 || now - this->last_flush_ms_ >= this->publish_interval_ms_) {
@@ -230,6 +236,12 @@ void CTClampConfig::update_from_reading(const SensorReading &sensor_reading) {
   this->power_factor_.add(this->power_now_, this->va_now_);
 }
 
+const LoadEvent *CTClampConfig::detect_more() {
+  if (this->detector_ == nullptr || !this->detector_->next())
+    return nullptr;
+  return &this->detector_->event();
+}
+
 const LoadEvent *CTClampConfig::detect(uint32_t now) {
   if (this->detector_ == nullptr)
     return nullptr;
@@ -258,6 +270,12 @@ void CircuitConfig::update_from_clamps() {
   this->current_.add(amps);
   this->apparent_power_.add(va);
   this->power_factor_.add(watts, va);
+}
+
+const LoadEvent *CircuitConfig::detect_more() {
+  if (this->detector_ == nullptr || !this->detector_->next())
+    return nullptr;
+  return &this->detector_->event();
 }
 
 const LoadEvent *CircuitConfig::detect(uint32_t now) {
