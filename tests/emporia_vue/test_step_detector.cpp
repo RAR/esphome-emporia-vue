@@ -369,6 +369,70 @@ static void a_step_reports_the_stretch_it_ended_and_its_stages() {
   CHECK(e.json().find("\"stages\":[[270,") != std::string::npos);
 }
 
+
+static void a_cycle_s_mean_leaves_out_the_step_that_ended_it_and_the_quiet_after() {
+  Run r;
+  r.hold(250, 30, 0.99f, 3);
+  bed(r, 510);                               // ends 10 frames into an on: the bed is high...
+  r.hold(250 + 265 + 3000, 60, 1.0f, 5);     // ...as a 3 kW oven comes on
+  const LoadEvent *end = nullptr;
+  for (auto &e : r.events)
+    if (e.cycling == 2)
+      end = &e;
+  CHECK(end != nullptr);
+  if (end)
+    NEAR(end->held_w, 250 + 265 * 0.4f, 15);
+  Run q;                                     // and stopping on its own: not the quiet tail
+  q.hold(250, 30, 0.99f, 3);
+  bed(q, 500);
+  q.hold(250, 400, 0.99f, 3);
+  end = nullptr;
+  for (auto &e : q.events)
+    if (e.cycling == 2)
+      end = &e;
+  CHECK(end != nullptr);
+  if (end)
+    NEAR(end->held_w, 250 + 265 * 0.4f, 12);
+}
+
+static void a_long_first_on_ends_with_its_own_step_down() {
+  Run r;
+  r.hold(250, 30, 0.99f, 3);
+  r.hold(515, 200, 0.99f, 3);                // a bed heating up from cold for 40 s
+  for (int i = 0; i < 500; i++)              // then holding: off first
+    r.feed({(((i + 10) % 25) < 10 ? 515.0f : 250.0f) + ((i % 2) ? 3.0f : -3.0f)}, 0.99f);
+  const LoadEvent *down = nullptr, *start = nullptr;
+  for (auto &e : r.events) {
+    if (!down && !e.cycling && e.from_w > 500 && e.to_w < 270)
+      down = &e;
+    if (e.cycling == 1)
+      start = &e;
+  }
+  CHECK(down != nullptr && start != nullptr);
+  const LoadEvent *end = nullptr;
+  r.hold(250, 400, 0.99f, 3);
+  for (auto &e : r.events)
+    if (e.cycling == 2)
+      end = &e;
+  CHECK(end != nullptr);
+  if (start && end) {
+    // One session from the heat-up on, its mean counting the heat-up at full power.
+    NEAR(start->start_ms, 30 * FRAME_MS, FRAME_MS);
+    float expect = 250 + 265 * (40.0f + 0.4f * 100) / 140.0f;   // 40 s on, then 100 s at 40 %
+    NEAR(end->held_w, expect, 15);
+  }
+}
+
+static void a_motor_s_settling_is_not_a_stage() {
+  Run r;
+  r.hold(10, 20, 0.6f, 1);
+  r.feed({520, 96, 91, 70, 64, 58, 57, 56}, 0.68f);
+  r.hold(56, 20, 0.68f, 1);
+  CHECK(r.events.size() == 1);
+  if (!r.events.empty())
+    CHECK(r.events[0].stage_count == 0);
+}
+
 int main() {
   struct {
     const char *name;
@@ -386,6 +450,9 @@ int main() {
       {"another load switching mid-cycle is still reported", another_load_switching_mid_cycle_is_still_reported},
       {"long runs are never cycling", long_runs_are_never_cycling},
       {"a step reports the stretch it ended and its stages", a_step_reports_the_stretch_it_ended_and_its_stages},
+      {"a cycle's mean leaves out the step that ended it and the quiet after", a_cycle_s_mean_leaves_out_the_step_that_ended_it_and_the_quiet_after},
+      {"a long first on ends with its own step down", a_long_first_on_ends_with_its_own_step_down},
+      {"a motor's settling is not a stage", a_motor_s_settling_is_not_a_stage},
       {"a brief load comes back as a pulse", a_brief_load_comes_back_as_a_pulse},
       {"a load that never settles is reported when it times out", a_load_that_never_settles_is_reported_when_it_times_out},
       {"steps follow on from each other", steps_follow_on_from_each_other},

@@ -105,7 +105,7 @@ sensor:
       drift_frames: 20    # a gradual change held this long (10 s) is reported; 0 never
       cycle_steps: 4      # alternating steps alike in size that make a cycling load; 0 never
       cycle_tolerance: 35%
-      cycle_window: 60s
+      cycle_window: 120s  # at least 1.5 of the load's periods
     on_load_event:
       - mqtt.publish:
           topic: my-vue/load_event

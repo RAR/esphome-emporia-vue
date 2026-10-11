@@ -187,7 +187,7 @@ SCHEMA_STEP_DETECTION = cv.Schema(
         # in a row alternate, alike within cycle_tolerance, within cycle_window. 0 never.
         cv.Optional(CONF_CYCLE_STEPS, default=4): cv.Any(cv.one_of(0, int=True), cv.int_range(min=3, max=8)),
         cv.Optional(CONF_CYCLE_TOLERANCE, default="35%"): cv.percentage,
-        cv.Optional(CONF_CYCLE_WINDOW, default="60s"): cv.All(
+        cv.Optional(CONF_CYCLE_WINDOW, default="120s"): cv.All(
             cv.positive_time_period_milliseconds,
             cv.Range(min=cv.TimePeriod(seconds=5), max=cv.TimePeriod(minutes=10)),
         ),

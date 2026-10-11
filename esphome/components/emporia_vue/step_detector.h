@@ -48,7 +48,7 @@ struct StepConfig {
   // alternate up and down, alike within cycle_tolerance of their size, within cycle_window_ms. 0 never.
   uint8_t cycle_steps = 4;
   float cycle_tolerance = 0.35f;
-  uint32_t cycle_window_ms = 60000;
+  uint32_t cycle_window_ms = 120000;  // at least 1.5 of its periods (an oven element's are 30-90 s)
 };
 
 struct LoadEvent {
@@ -189,9 +189,16 @@ class StepDetector {
     this->out_n_ = this->out_i_ = 0;
     if (std::isnan(w))
       return false;
+    // A cycling load's mean is weighted by time (W x ms), so the switches before it was recognised
+    // can be counted in by how long each level lasted.
+    uint32_t dt = this->last_ms_ ? std::min<uint32_t>(ms - this->last_ms_, 5000) : 0;
+    this->last_ms_ = ms;
+    this->ring_w_[this->ring_head_] = w * dt;
+    this->ring_dt_[this->ring_head_] = dt;
+    this->ring_head_ = (this->ring_head_ + 1) % WINDOW;
     if (this->cycling_) {
-      this->cyc_sum_ += w;
-      this->cyc_n_++;
+      this->cyc_sum_ += (double) w * dt;
+      this->cyc_n_ += dt;
     }
     if (this->step(w, va, ms))
       this->route(ms);
@@ -365,6 +372,15 @@ class StepDetector {
     uint8_t n = this->pending_;
     this->pending_ = 0;
     this->lead_ = e.count;
+    // A cycling load's mean stops where this step began: if the step ends the cycling, its frames are
+    // not the cycling load's.
+    this->step_sum_ = this->cyc_sum_;
+    this->step_n_ = this->cyc_n_;
+    for (uint8_t i = 0; i < n; i++) {  // the confirm frames, the latest n fed
+      uint8_t at = (this->ring_head_ + WINDOW - 1 - i) % WINDOW;
+      this->step_sum_ -= this->ring_w_[at];
+      this->step_n_ = this->step_n_ > this->ring_dt_[at] ? this->step_n_ - this->ring_dt_[at] : 0;
+    }
     for (uint8_t i = 0; i < n; i++)
       this->capture(this->pend_w_[i], this->pend_va_[i], this->pend_ms_[i]);
   }
@@ -414,7 +430,9 @@ class StepDetector {
     auto close = [&]() {
       if (run_n >= 2 && e.stage_count < LoadEvent::MAX_STAGES) {
         float m = run_sum / run_n;
-        if (std::fabs(m - e.from_w) > this->tolerance(e.from_w) && std::fabs(m - e.to_w) > this->tolerance(e.to_w)) {
+        // Strictly between where it started and settled: an inrush's or overshoot's decay lies beyond.
+        bool between = (m - e.from_w) * (e.to_w - m) > 0;
+        if (between && std::fabs(m - e.from_w) > this->tolerance(e.from_w) && std::fabs(m - e.to_w) > this->tolerance(e.to_w)) {
           e.stage_w[e.stage_count] = m;
           e.stage_frames[e.stage_count++] = run_n;
         }
@@ -449,13 +467,16 @@ class StepDetector {
       return;
     }
     if (this->cycling_) {
-      if (e.pulse)
+      if (e.pulse) {
+        if (this->short_on(e))
+          this->pulse_toggle(e);
         return;
+      }
       if (this->fits(e)) {
         this->toggle(e);
         return;
       }
-      this->end_cycle(e.from_w, e.start_ms);
+      this->end_cycle(e.from_w, e.start_ms, this->step_sum_, this->step_n_);
       this->push(&e);
       this->remember_step(e);
       return;
@@ -489,6 +510,10 @@ class StepDetector {
       return false;
     const uint8_t first = this->hist_n_ - n;
     if (this->hist_ms_[this->hist_n_ - 1] - this->hist_ms_[first] > this->cfg_.cycle_window_ms)
+      return false;
+    // Counted from a switch on: a long first on (a bed heating up from cold) then ends with a step down
+    // that is still reported, so it is a run of its own.
+    if (this->hist_dw_[first] <= 0)
       return false;
     float size = 0;
     for (uint8_t i = first; i < this->hist_n_; i++) {
@@ -527,8 +552,16 @@ class StepDetector {
     this->cyc_start_ms_ = this->hist_ms_[first];
     this->last_toggle_ms_ = this->hist_ms_[this->hist_n_ - 1];
     this->last_up_ = this->hist_dw_[this->hist_n_ - 1] > 0;
+    // Counted in from its first switch: each level for as long as it lasted (a long heat-up at full power).
     this->cyc_sum_ = 0;
-    this->cyc_n_ = 0;
+    for (uint8_t i = first; i < this->hist_n_; i++) {
+      float level = this->hist_low_[i] + (this->hist_dw_[i] > 0 ? std::fabs(this->hist_dw_[i]) : 0.0f);
+      uint32_t until = i + 1 < this->hist_n_ ? this->hist_ms_[i + 1] : ms;
+      this->cyc_sum_ += (double) level * (until - this->hist_ms_[i]);
+    }
+    this->cyc_n_ = ms - this->hist_ms_[first];
+    this->idle_sum_ = this->cyc_sum_;
+    this->idle_n_ = this->cyc_n_;
     LoadEvent &c = this->cycle_event(1, this->cyc_low_, this->cyc_low_ + this->cyc_amp_ * this->duty_now(), this->cyc_start_ms_);
     c.spans_ms = ms - this->cyc_start_ms_;
     this->push(&c);
@@ -544,6 +577,22 @@ class StepDetector {
     return std::fabs(e.to_w - level) <= std::max(this->cfg_.min_step_w, 0.15f * this->cyc_amp_);
   }
 
+  // A pulse from the low level up to the high and back: an on too short to settle (a bed near its setpoint).
+  bool short_on(const LoadEvent &e) const {
+    float near = std::max(this->cfg_.min_step_w, 0.15f * this->cyc_amp_);
+    return !this->last_up_ && std::fabs(e.from_w - this->cyc_low_) <= near &&
+           std::fabs(e.peak_w - (this->cyc_low_ + this->cyc_amp_)) <= near;
+  }
+  void pulse_toggle(const LoadEvent &e) {
+    uint32_t width = e.settle_ms;
+    this->cyc_total_ms_ += (e.start_ms - this->last_toggle_ms_) + width;
+    this->cyc_high_ms_ += width;
+    this->cyc_toggles_ += 2;
+    this->last_toggle_ms_ = e.start_ms + width;
+    this->idle_sum_ = this->cyc_sum_;
+    this->idle_n_ = this->cyc_n_;
+  }
+
   void toggle(const LoadEvent &e) {
     uint32_t gap = e.start_ms - this->last_toggle_ms_;
     this->cyc_total_ms_ += gap;
@@ -555,6 +604,8 @@ class StepDetector {
     if (!this->last_up_)
       this->cyc_low_ += 0.25f * (e.to_w - this->cyc_low_);
     this->cyc_amp_ += 0.2f * (std::fabs(e.to_w - e.from_w) - this->cyc_amp_);
+    this->idle_sum_ = this->cyc_sum_;
+    this->idle_n_ = this->cyc_n_;
   }
 
   // Off at the low level, and no switch for three of its usual gaps (or a timeout): it has stopped.
@@ -563,12 +614,15 @@ class StepDetector {
     if (this->last_up_)
       return;
     uint32_t usual = this->cyc_toggles_ ? this->cyc_total_ms_ / this->cyc_toggles_ : 0;
-    if (ms - this->last_toggle_ms_ > std::max<uint32_t>(3 * usual, this->cfg_.timeout_ms))
-      this->end_cycle(this->base_, this->last_toggle_ms_);
+    // Three usual gaps, but never longer than the window (one long hold at full power makes "usual" huge).
+    uint32_t wait = std::max<uint32_t>(std::min<uint32_t>(3 * usual, this->cfg_.cycle_window_ms), this->cfg_.timeout_ms);
+    if (ms - this->last_toggle_ms_ > wait)
+      this->end_cycle(this->base_, this->last_toggle_ms_, this->idle_sum_, this->idle_n_);  // not the quiet tail
   }
 
-  void end_cycle(float to_w, uint32_t at_ms) {
-    float mean = this->cyc_n_ ? this->cyc_sum_ / this->cyc_n_ : this->cyc_low_ + this->cyc_amp_ * this->duty_now();
+  // Ends the cycling at at_ms; sum and n are its frames up to then.
+  void end_cycle(float to_w, uint32_t at_ms, double sum, uint32_t n) {
+    float mean = n ? (float) (sum / n) : this->cyc_low_ + this->cyc_amp_ * this->duty_now();
     LoadEvent &c = this->cycle_event(2, mean, to_w, at_ms);
     c.held_w = mean;
     c.held_span_w = this->cyc_amp_;
@@ -652,6 +706,8 @@ class StepDetector {
     e.pulse = std::fabs(mean - e.from_w) < this->threshold(e.from_w, mean);
     e.settle_ms = this->win_ms_[this->recent(0, have)] - e.start_ms;
     this->stages(e, have);
+    if (e.pulse)
+      e.stage_count = 0;
     // The settled frames are the new level and lead into the next step.
     this->base_ = mean;
     if (va_n)
@@ -685,7 +741,13 @@ class StepDetector {
   float hist_dw_[HISTORY]{}, hist_low_[HISTORY]{};
   uint8_t hist_n_{0};
   bool cycling_{false}, last_up_{false};
-  float cyc_low_{0}, cyc_amp_{0}, cyc_sum_{0};
+  float cyc_low_{0}, cyc_amp_{0};
+  double cyc_sum_{0}, step_sum_{0}, idle_sum_{0};  // W x ms: all of it, where the latest step began, at its last switch
+  uint32_t step_n_{0}, idle_n_{0};                 // and the ms each covers
+  uint32_t last_ms_{0};
+  float ring_w_[WINDOW]{};                         // the latest frames' W x ms and ms, to take the confirm frames back out
+  uint32_t ring_dt_[WINDOW]{};
+  uint8_t ring_head_{0};
   uint32_t cyc_n_{0}, cyc_start_ms_{0}, last_toggle_ms_{0}, cyc_high_ms_{0}, cyc_total_ms_{0}, cyc_toggles_{0};
   bool primed_{false};
   bool moving_{false};
