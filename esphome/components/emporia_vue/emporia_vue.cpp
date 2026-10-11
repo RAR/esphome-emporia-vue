@@ -47,7 +47,13 @@ void EmporiaVueComponent::dump_config() {
     ESP_LOGCONFIG(TAG, "    CT Port Index: %d", ct_clamp->get_input_port());
     LOG_SENSOR("    ", "Power", ct_clamp->get_power_sensor());
     LOG_SENSOR("    ", "Current", ct_clamp->get_current_sensor());
+    LOG_SENSOR("    ", "Apparent Power", ct_clamp->get_apparent_power_sensor());
+    LOG_SENSOR("    ", "Power Factor", ct_clamp->get_power_factor_sensor());
   }
+  ESP_LOGCONFIG(TAG, "  Circuits: %u", (unsigned) this->circuits_.size());
+  ESP_LOGCONFIG(TAG, "  Publish interval: %u ms", (unsigned) this->publish_interval_ms_);
+  LOG_SENSOR("  ", "Frame Rate", this->frame_rate_sensor_);
+  LOG_SENSOR("  ", "Missed Frames", this->missed_frames_sensor_);
 }
 
 void EmporiaVueComponent::update() {
@@ -73,21 +79,83 @@ void EmporiaVueComponent::update() {
 
   ESP_LOGV(TAG, "Received sensor reading with sequence #%d", sensor_reading.sequence_num);
 
-  if (this->last_sequence_num_ && sensor_reading.sequence_num > this->last_sequence_num_ + 1) {
-    ESP_LOGW(TAG, "Detected %d missing reading(s), data may not be accurate!",
-             sensor_reading.sequence_num - this->last_sequence_num_ - 1);
+  if (this->have_sequence_) {
+    // The sequence number is one byte, so count across its wrap.
+    uint8_t missed = static_cast<uint8_t>(sensor_reading.sequence_num - this->last_sequence_num_ - 1);
+    if (missed != 0 && missed < 128) {
+      ESP_LOGW(TAG, "Detected %d missing reading(s), data may not be accurate!", missed);
+      this->missed_frames_ += missed;
+    }
   }
+  this->have_sequence_ = true;
+  this->last_sequence_num_ = sensor_reading.sequence_num;
 
+  const uint32_t now = millis();
   for (auto *phase : this->phases_) {
     phase->update_from_reading(sensor_reading);
   }
   for (auto *ct_clamp : this->ct_clamps_) {
     ct_clamp->update_from_reading(sensor_reading);
   }
+  for (auto *circuit : this->circuits_) {
+    circuit->update_from_clamps();
+  }
+  for (auto *ct_clamp : this->ct_clamps_) {
+    if (const LoadEvent *event = ct_clamp->detect(now))
+      this->report_load_event(*event);
+  }
+  for (auto *circuit : this->circuits_) {
+    if (const LoadEvent *event = circuit->detect(now))
+      this->report_load_event(*event);
+  }
 
-  this->last_sequence_num_ = sensor_reading.sequence_num;
+  if (this->publish_interval_ms_ == 0 || now - this->last_flush_ms_ >= this->publish_interval_ms_) {
+    this->last_flush_ms_ = now;
+    this->flush_();
+  }
+  this->frames_since_++;
+  this->publish_diagnostics_(now);
 
   this->callback_.call();
+}
+
+void EmporiaVueComponent::flush_() {
+  for (auto *phase : this->phases_)
+    phase->flush();
+  for (auto *ct_clamp : this->ct_clamps_)
+    ct_clamp->flush();
+  for (auto *circuit : this->circuits_)
+    circuit->flush();
+}
+
+// The frame rate and missed frames, every publish interval but no more often than every 10 s.
+void EmporiaVueComponent::publish_diagnostics_(uint32_t now) {
+  if (this->diagnostics_ms_ == 0) {
+    this->diagnostics_ms_ = now;
+    this->frames_since_ = 0;
+    return;
+  }
+  uint32_t elapsed = now - this->diagnostics_ms_;
+  if (elapsed < std::max<uint32_t>(this->publish_interval_ms_, 10000))
+    return;
+  if (this->frame_rate_sensor_ != nullptr)
+    this->frame_rate_sensor_->publish_state(this->frames_since_ * 1000.0f / elapsed);
+  if (this->missed_frames_sensor_ != nullptr)
+    this->missed_frames_sensor_->publish_state(this->missed_frames_);
+  this->diagnostics_ms_ = now;
+  this->frames_since_ = 0;
+}
+
+void EmporiaVueComponent::add_on_load_event_callback(std::function<void(const LoadEvent &)> &&callback) {
+  this->load_event_callback_.add(std::move(callback));
+}
+
+void EmporiaVueComponent::report_load_event(const LoadEvent &event) {
+  ESP_LOGD(TAG, "Load event on %s: %.0f W -> %.0f W (peak %.0f W, settled in %u ms)", event.key, event.from_w,
+           event.to_w, event.peak_w, (unsigned) event.settle_ms);
+  LoadEvent reported = event;
+  reported.reported_ms = millis();
+  this->load_event_callback_.call(reported);
 }
 
 void EmporiaVueComponent::add_on_update_callback(std::function<void()> &&callback) {
@@ -99,24 +167,28 @@ static inline bool is_mains_port(CTInputPort port) {
 }
 
 void PhaseConfig::update_from_reading(const SensorReading &sensor_reading) {
-  if (this->voltage_sensor_) {
-    float calibrated_voltage = sensor_reading.voltage[this->input_wire_] * this->calibration_;
-    this->voltage_sensor_->publish_state(calibrated_voltage);
-  }
+  this->voltage_now_ = sensor_reading.voltage[this->input_wire_] * this->calibration_;
+  this->voltage_.add(this->voltage_now_);
 
   uint16_t raw_frequency = sensor_reading.frequency;
+  if (raw_frequency == 0)
+    return;
   // validation that these sensors are allowed on this phase is done in the codegen stage
-  if (this->frequency_sensor_) {
+  if (this->frequency_.sensor) {
     // see https://github.com/emporia-vue-local/esphome/pull/88 for constant explanation
-    float frequency = EMPORIA_VUE_FREQUENCY_CONSTANT / static_cast<float>(raw_frequency);
-    this->frequency_sensor_->publish_state(frequency);
+    this->frequency_.add(EMPORIA_VUE_FREQUENCY_CONSTANT / static_cast<float>(raw_frequency));
   }
-  if (this->phase_angle_sensor_) {
+  if (this->phase_angle_.sensor) {
     uint16_t raw_phase_angle = sensor_reading.degrees[((uint8_t) this->input_wire_) - 1];
-    float phase_angle = ((float) raw_phase_angle) * 360.0f / ((float) raw_frequency);
     // this is truncated to a uint16_t on the vue 2
-    this->phase_angle_sensor_->publish_state(phase_angle);
+    this->phase_angle_.add(((float) raw_phase_angle) * 360.0f / ((float) raw_frequency));
   }
+}
+
+void PhaseConfig::flush() {
+  this->voltage_.flush();
+  this->frequency_.flush();
+  this->phase_angle_.flush();
 }
 
 int32_t PhaseConfig::extract_power_for_phase(const ReadingPowerEntry &power_entry) {
@@ -134,23 +206,69 @@ int32_t PhaseConfig::extract_power_for_phase(const ReadingPowerEntry &power_entr
 }
 
 void CTClampConfig::update_from_reading(const SensorReading &sensor_reading) {
-  if (this->power_sensor_) {
-    ReadingPowerEntry power_entry = sensor_reading.power[this->input_port_];
-    int32_t raw_power = this->phase_->extract_power_for_phase(power_entry);
-    float calibrated_power = this->get_calibrated_power(raw_power);
-    this->power_sensor_->publish_state(calibrated_power);
+  ReadingPowerEntry power_entry = sensor_reading.power[this->input_port_];
+  int32_t raw_power = this->phase_->extract_power_for_phase(power_entry);
+  this->power_now_ = this->get_calibrated_power(raw_power) * (this->reverse_ ? -1.0f : 1.0f);
+
+  uint16_t raw_current = sensor_reading.current[this->input_port_];
+  double scalar;
+  if (is_mains_port(this->input_port_)) {
+    scalar = 775.0 / 42624.0;
+  } else {
+    scalar = 775.0 / 170496.0;
   }
-  if (this->current_sensor_) {
-    uint16_t raw_current = sensor_reading.current[this->input_port_];
-    double raw_current_d = (double) raw_current;
-    double scalar;
-    if (is_mains_port(this->input_port_)) {
-      scalar = 775.0 / 42624.0;
-    } else {
-      scalar = 775.0 / 170496.0;
-    }
-    this->current_sensor_->publish_state(raw_current_d * scalar);
+  this->current_now_ = raw_current * scalar;
+  this->va_now_ = this->current_now_ * this->phase_->get_voltage();
+
+  this->power_.add(this->power_now_);
+  this->current_.add(this->current_now_);
+  this->apparent_power_.add(this->va_now_);
+  this->power_factor_.add(this->power_now_, this->va_now_);
+}
+
+const LoadEvent *CTClampConfig::detect(uint32_t now) {
+  if (this->detector_ == nullptr)
+    return nullptr;
+  if (!this->detector_->feed(this->power_now_, power_factor(this->power_now_, this->va_now_), now))
+    return nullptr;
+  return &this->detector_->event();
+}
+
+void CTClampConfig::flush() {
+  this->power_.flush();
+  this->current_.flush();
+  this->apparent_power_.flush();
+  this->power_factor_.flush();
+}
+
+void CircuitConfig::update_from_clamps() {
+  float watts = 0, va = 0, amps = 0;
+  for (auto *clamp : this->clamps_) {
+    watts += clamp->get_power();
+    va += clamp->get_apparent_power();
+    amps = std::max(amps, clamp->get_current());
   }
+  this->power_now_ = watts;
+  this->va_now_ = va;
+  this->power_.add(watts);
+  this->current_.add(amps);
+  this->apparent_power_.add(va);
+  this->power_factor_.add(watts, va);
+}
+
+const LoadEvent *CircuitConfig::detect(uint32_t now) {
+  if (this->detector_ == nullptr)
+    return nullptr;
+  if (!this->detector_->feed(this->power_now_, power_factor(this->power_now_, this->va_now_), now))
+    return nullptr;
+  return &this->detector_->event();
+}
+
+void CircuitConfig::flush() {
+  this->power_.flush();
+  this->current_.flush();
+  this->apparent_power_.flush();
+  this->power_factor_.flush();
 }
 
 float CTClampConfig::get_calibrated_power(int32_t raw_power) const {

@@ -2,8 +2,11 @@ from esphome.components import sensor, i2c
 from esphome import automation
 import esphome.config_validation as cv
 import esphome.codegen as cg
+import re
+
 from esphome.const import (
     CONF_CALIBRATION,
+    CONF_NAME,
     CONF_CURRENT,
     CONF_ID,
     CONF_INPUT,
@@ -12,7 +15,12 @@ from esphome.const import (
     CONF_VOLTAGE,
     CONF_FREQUENCY,
     CONF_PHASE_ANGLE,
+    DEVICE_CLASS_APPARENT_POWER,
     DEVICE_CLASS_CURRENT,
+    DEVICE_CLASS_POWER_FACTOR,
+    ENTITY_CATEGORY_DIAGNOSTIC,
+    STATE_CLASS_TOTAL_INCREASING,
+    UNIT_VOLT_AMPS,
     DEVICE_CLASS_FREQUENCY,
     DEVICE_CLASS_POWER,
     DEVICE_CLASS_VOLTAGE,
@@ -30,6 +38,24 @@ CONF_PHASE_ID = "phase_id"
 CONF_VARIANT = "variant"
 
 CONF_ON_UPDATE = "on_update"
+CONF_ON_LOAD_EVENT = "on_load_event"
+CONF_CIRCUITS = "circuits"
+CONF_INPUTS = "inputs"
+CONF_KEY = "key"
+CONF_REVERSE = "reverse"
+CONF_APPARENT_POWER = "apparent_power"
+CONF_POWER_FACTOR = "power_factor"
+CONF_PUBLISH_INTERVAL = "publish_interval"
+CONF_FRAME_RATE = "frame_rate"
+CONF_MISSED_FRAMES = "missed_frames"
+CONF_LOAD_EVENTS = "load_events"
+CONF_MIN_STEP = "min_step"
+CONF_MIN_STEP_PERCENT = "min_step_percent"
+CONF_SETTLE_WITHIN = "settle_within"
+CONF_SETTLE_WITHIN_PERCENT = "settle_within_percent"
+CONF_CONFIRM_FRAMES = "confirm_frames"
+CONF_SETTLE_FRAMES = "settle_frames"
+CONF_TIMEOUT = "timeout"
 
 CODEOWNERS = ["@flaviut", "@Maelstrom96", "@krconv"]
 ESP_PLATFORMS = ["esp-idf"]
@@ -42,10 +68,18 @@ EmporiaVueComponent = emporia_vue_ns.class_(
 )
 PhaseConfig = emporia_vue_ns.class_("PhaseConfig")
 CTClampConfig = emporia_vue_ns.class_("CTClampConfig")
+CircuitConfig = emporia_vue_ns.class_("CircuitConfig")
+LoadEvent = emporia_vue_ns.struct("LoadEvent")
+StepConfig = emporia_vue_ns.struct("StepConfig")
 
 # Trigger for after statistics sensors are updated
 EmporiaVueUpdateTrigger = emporia_vue_ns.class_(
     "EmporiaVueUpdateTrigger", automation.Trigger.template()
+)
+# Trigger for a finished step on a clamp or circuit that watches for them
+EmporiaVueLoadEventTrigger = emporia_vue_ns.class_(
+    "EmporiaVueLoadEventTrigger",
+    automation.Trigger.template(LoadEvent.operator("const").operator("ref")),
 )
 
 
@@ -79,10 +113,11 @@ CT_INPUT = {
     "16": CTInputPort.SIXTEEN,
 }
 
-SCHEMA_CT_CLAMP = {
-    cv.GenerateID(): cv.declare_id(CTClampConfig),
-    cv.Required(CONF_PHASE_ID): cv.use_id(PhaseConfig),
-    cv.Required(CONF_INPUT): cv.enum(CT_INPUT),
+MAINS_INPUTS = {"A", "B", "C"}
+
+watts = cv.float_with_unit("power", "(w|W)?")
+
+SCHEMA_MEASURED = {
     cv.Optional(CONF_POWER): sensor.sensor_schema(
         unit_of_measurement=UNIT_WATT,
         device_class=DEVICE_CLASS_POWER,
@@ -95,7 +130,69 @@ SCHEMA_CT_CLAMP = {
         state_class=STATE_CLASS_MEASUREMENT,
         accuracy_decimals=2,
     ),
+    cv.Optional(CONF_APPARENT_POWER): sensor.sensor_schema(
+        unit_of_measurement=UNIT_VOLT_AMPS,
+        device_class=DEVICE_CLASS_APPARENT_POWER,
+        state_class=STATE_CLASS_MEASUREMENT,
+        accuracy_decimals=1,
+    ),
+    cv.Optional(CONF_POWER_FACTOR): sensor.sensor_schema(
+        device_class=DEVICE_CLASS_POWER_FACTOR,
+        state_class=STATE_CLASS_MEASUREMENT,
+        accuracy_decimals=2,
+    ),
+    # The name its load events carry; defaults to the power sensor's name without
+    # "Power" (Hot Tub Power -> hot_tub).
+    cv.Optional(CONF_KEY): cv.string_strict,
+    # Whether to watch it for load events (see on_load_event).
+    cv.Optional(CONF_LOAD_EVENTS): cv.boolean,
 }
+
+SCHEMA_CT_CLAMP = {
+    cv.GenerateID(): cv.declare_id(CTClampConfig),
+    cv.Required(CONF_PHASE_ID): cv.use_id(PhaseConfig),
+    cv.Required(CONF_INPUT): cv.enum(CT_INPUT),
+    # For a clamp fitted the wrong way round.
+    cv.Optional(CONF_REVERSE, default=False): cv.boolean,
+    **SCHEMA_MEASURED,
+}
+
+SCHEMA_CIRCUIT = {
+    cv.GenerateID(): cv.declare_id(CircuitConfig),
+    # The clamps measuring it, by input; each must also be listed under ct_clamps.
+    cv.Required(CONF_INPUTS): cv.All(
+        cv.ensure_list(cv.enum(CT_INPUT)), cv.Length(min=2, max=3)
+    ),
+    **SCHEMA_MEASURED,
+}
+
+SCHEMA_LOAD_EVENTS = cv.Schema(
+    {
+        cv.Optional(CONF_MIN_STEP, default="30W"): watts,
+        cv.Optional(CONF_MIN_STEP_PERCENT, default="5%"): cv.percentage,
+        cv.Optional(CONF_SETTLE_WITHIN, default="10W"): watts,
+        cv.Optional(CONF_SETTLE_WITHIN_PERCENT, default="3%"): cv.percentage,
+        cv.Optional(CONF_CONFIRM_FRAMES, default=2): cv.int_range(min=1, max=8),
+        cv.Optional(CONF_SETTLE_FRAMES, default=4): cv.int_range(min=2, max=8),
+        cv.Optional(CONF_TIMEOUT, default="10s"): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(max=cv.TimePeriod(seconds=60)),
+        ),
+    }
+)
+
+
+def _slug(text):
+    return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
+
+
+def _key(item, fallback):
+    if CONF_KEY in item:
+        return item[CONF_KEY]
+    if CONF_POWER in item and CONF_NAME in item[CONF_POWER]:
+        # "Hot Tub Power" -> "hot_tub", the name its power sensor's object id starts with
+        return re.sub(r"_power$", "", _slug(item[CONF_POWER][CONF_NAME])) or "power"
+    return fallback
 
 
 def validate_phases(val):
@@ -153,17 +250,89 @@ def validate_phases(val):
     return base_validated
 
 
+def validate_channels(config):
+    """Circuits name clamps that exist and are in no other circuit; event keys are unique."""
+    clamp_inputs = [str(ct[CONF_INPUT]) for ct in config[CONF_CT_CLAMPS]]
+    for i, ct in enumerate(config[CONF_CT_CLAMPS]):
+        if clamp_inputs.index(str(ct[CONF_INPUT])) != i:
+            raise cv.Invalid(
+                f"Input {ct[CONF_INPUT]} is listed twice", path=[CONF_CT_CLAMPS, i, CONF_INPUT]
+            )
+    in_circuit = set()
+    for i, circuit in enumerate(config.get(CONF_CIRCUITS, [])):
+        for j, inp in enumerate(circuit[CONF_INPUTS]):
+            path = [CONF_CIRCUITS, i, CONF_INPUTS, j]
+            if str(inp) not in clamp_inputs:
+                raise cv.Invalid(f"Input {inp} is not listed under ct_clamps", path=path)
+            if str(inp) in in_circuit:
+                raise cv.Invalid(f"Input {inp} is already in another circuit", path=path)
+            in_circuit.add(str(inp))
+
+    watching = CONF_ON_LOAD_EVENT in config
+    keys = {}
+
+    def watch(item, default, fallback, path):
+        on = item.get(CONF_LOAD_EVENTS, default)
+        if on and not watching:
+            raise cv.Invalid(
+                "load_events needs an on_load_event automation to report them to",
+                path=path + [CONF_LOAD_EVENTS],
+            )
+        if not on:
+            return
+        key = _key(item, fallback)
+        if key in keys:
+            raise cv.Invalid(
+                f"Load event key '{key}' is used twice (set a key: to tell them apart)",
+                path=path,
+            )
+        keys[key] = path
+
+    for i, ct in enumerate(config[CONF_CT_CLAMPS]):
+        inp = str(ct[CONF_INPUT])
+        default = watching and inp not in MAINS_INPUTS and inp not in in_circuit
+        watch(ct, default, f"input_{inp}", [CONF_CT_CLAMPS, i])
+    for i, circuit in enumerate(config.get(CONF_CIRCUITS, [])):
+        inputs = "_".join(str(inp) for inp in circuit[CONF_INPUTS])
+        watch(circuit, watching, f"inputs_{inputs}", [CONF_CIRCUITS, i])
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(EmporiaVueComponent),
             cv.Required(CONF_PHASES): validate_phases,
             cv.Required(CONF_CT_CLAMPS): cv.ensure_list(SCHEMA_CT_CLAMP),
+            cv.Optional(CONF_CIRCUITS): cv.ensure_list(SCHEMA_CIRCUIT),
             cv.Optional(CONF_VARIANT, default="vue2"): cv.one_of("vue2", "vue3", lower=True),
+            # Publish each sensor's mean over this span instead of every frame.
+            cv.Optional(CONF_PUBLISH_INTERVAL): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_FRAME_RATE): sensor.sensor_schema(
+                unit_of_measurement=UNIT_HERTZ,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                accuracy_decimals=2,
+                icon="mdi:speedometer",
+            ),
+            cv.Optional(CONF_MISSED_FRAMES): sensor.sensor_schema(
+                state_class=STATE_CLASS_TOTAL_INCREASING,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                accuracy_decimals=0,
+                icon="mdi:alert-circle-outline",
+            ),
+            cv.Optional(CONF_LOAD_EVENTS, default={}): SCHEMA_LOAD_EVENTS,
             cv.Optional(CONF_ON_UPDATE): automation.validate_automation(
                 {
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
                         EmporiaVueUpdateTrigger
+                    ),
+                }
+            ),
+            cv.Optional(CONF_ON_LOAD_EVENT): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
+                        EmporiaVueLoadEventTrigger
                     ),
                 }
             ),
@@ -172,7 +341,21 @@ CONFIG_SCHEMA = cv.All(
     .extend(cv.polling_component_schema("200ms"))
     .extend(i2c.i2c_device_schema(0x64)),
     cv.only_on_esp32,
+    validate_channels,
 )
+
+
+async def _measured(var, item, step_config, watching, default, fallback):
+    for conf, setter in (
+        (CONF_POWER, var.set_power_sensor),
+        (CONF_CURRENT, var.set_current_sensor),
+        (CONF_APPARENT_POWER, var.set_apparent_power_sensor),
+        (CONF_POWER_FACTOR, var.set_power_factor_sensor),
+    ):
+        if conf in item:
+            cg.add(setter(await sensor.new_sensor(item[conf])))
+    if watching and item.get(CONF_LOAD_EVENTS, default):
+        cg.add(var.set_load_events(_key(item, fallback), step_config))
 
 
 async def to_code(config):
@@ -206,24 +389,61 @@ async def to_code(config):
         phases.append(phase_var)
     cg.add(var.set_phases(phases))
 
+    if CONF_PUBLISH_INTERVAL in config:
+        cg.add(var.set_publish_interval(config[CONF_PUBLISH_INTERVAL]))
+    if CONF_FRAME_RATE in config:
+        cg.add(var.set_frame_rate_sensor(await sensor.new_sensor(config[CONF_FRAME_RATE])))
+    if CONF_MISSED_FRAMES in config:
+        cg.add(var.set_missed_frames_sensor(await sensor.new_sensor(config[CONF_MISSED_FRAMES])))
+
+    events = config[CONF_LOAD_EVENTS]
+    watching = CONF_ON_LOAD_EVENT in config
+    step_config = cg.StructInitializer(
+        StepConfig,
+        ("min_step_w", events[CONF_MIN_STEP]),
+        ("rel_step", events[CONF_MIN_STEP_PERCENT]),
+        ("settle_w", events[CONF_SETTLE_WITHIN]),
+        ("settle_rel", events[CONF_SETTLE_WITHIN_PERCENT]),
+        ("confirm", events[CONF_CONFIRM_FRAMES]),
+        ("settle_frames", events[CONF_SETTLE_FRAMES]),
+        ("timeout_ms", events[CONF_TIMEOUT].total_milliseconds),
+    )
+
+    in_circuit = {str(inp) for c in config.get(CONF_CIRCUITS, []) for inp in c[CONF_INPUTS]}
     ct_clamps = []
+    by_input = {}
     for ct_config in config[CONF_CT_CLAMPS]:
         ct_clamp_var = cg.new_Pvariable(ct_config[CONF_ID], CTClampConfig())
         phase_var = await cg.get_variable(ct_config[CONF_PHASE_ID])
         cg.add(ct_clamp_var.set_phase(phase_var))
         cg.add(ct_clamp_var.set_input_port(ct_config[CONF_INPUT]))
+        if ct_config[CONF_REVERSE]:
+            cg.add(ct_clamp_var.set_reverse(True))
 
-        if CONF_POWER in ct_config:
-            power_sensor = await sensor.new_sensor(ct_config[CONF_POWER])
-            cg.add(ct_clamp_var.set_power_sensor(power_sensor))
-
-        if CONF_CURRENT in ct_config:
-            current_sensor = await sensor.new_sensor(ct_config[CONF_CURRENT])
-            cg.add(ct_clamp_var.set_current_sensor(current_sensor))
+        inp = str(ct_config[CONF_INPUT])
+        default = inp not in MAINS_INPUTS and inp not in in_circuit
+        await _measured(ct_clamp_var, ct_config, step_config, watching, default, f"input_{inp}")
 
         ct_clamps.append(ct_clamp_var)
+        by_input[inp] = ct_clamp_var
     cg.add(var.set_ct_clamps(ct_clamps))
+
+    circuits = []
+    for circuit_config in config.get(CONF_CIRCUITS, []):
+        circuit_var = cg.new_Pvariable(circuit_config[CONF_ID], CircuitConfig())
+        inputs = [str(inp) for inp in circuit_config[CONF_INPUTS]]
+        cg.add(circuit_var.set_clamps([by_input[inp] for inp in inputs]))
+        await _measured(circuit_var, circuit_config, step_config, watching, True, "inputs_" + "_".join(inputs))
+        circuits.append(circuit_var)
+    if circuits:
+        cg.add(var.set_circuits(circuits))
 
     for trigger_conf in config.get(CONF_ON_UPDATE, []):
         trigger = cg.new_Pvariable(trigger_conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trigger, [], trigger_conf )
+
+    for trigger_conf in config.get(CONF_ON_LOAD_EVENT, []):
+        trigger = cg.new_Pvariable(trigger_conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(
+            trigger, [(LoadEvent.operator("const").operator("ref"), "event")], trigger_conf
+        )

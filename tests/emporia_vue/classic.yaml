@@ -1,0 +1,43 @@
+# The configuration style from before the new options still validates unchanged.
+esphome:
+  name: vue-classic
+
+external_components:
+  - source:
+      type: local
+      path: ../../esphome/components
+    components: [emporia_vue]
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+i2c:
+  sda: 5
+  scl: 18
+  frequency: 400kHz
+
+sensor:
+  - platform: emporia_vue
+    variant: vue3
+    phases:
+      - id: phase_a
+        input: BLACK
+        calibration: 0.01925
+        voltage:
+          name: Phase A Voltage
+          filters: [{ throttle_average: 5s }]
+    ct_clamps:
+      - phase_id: phase_a
+        input: "A"
+        power: { id: phase_a_power, filters: [{ lambda: "return max(x, 0.0f);" }] }
+      - { phase_id: phase_a, input: "1", power: { id: cir1 } }
+    on_update:
+      then:
+        - component.update: total_power
+  - { platform: copy, name: "Circuit 1 Power", source_id: cir1, filters: [{ throttle_average: 5s }] }
+  - platform: template
+    id: total_power
+    lambda: return id(phase_a_power).state;
+    update_interval: never

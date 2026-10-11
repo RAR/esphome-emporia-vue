@@ -1,0 +1,91 @@
+# Builds the component with every new option:
+#   esphome compile tests/emporia_vue/better-sensing.yaml
+esphome:
+  name: vue-test
+
+external_components:
+  - source:
+      type: local
+      path: ../../esphome/components
+    components: [emporia_vue]
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+wifi:
+  ssid: test
+  password: test-password
+
+mqtt:
+  broker: 192.168.0.2
+
+i2c:
+  sda: 5
+  scl: 18
+  frequency: 400kHz
+
+sensor:
+  - platform: emporia_vue
+    variant: vue3
+    publish_interval: 5s
+    frame_rate:
+      name: Frame Rate
+    missed_frames:
+      name: Missed Frames
+    phases:
+      - id: phase_a
+        input: BLACK
+        calibration: 0.01925
+        voltage:
+          name: Phase A Voltage
+        frequency:
+          name: Frequency
+      - id: phase_b
+        input: RED
+        calibration: 0.01925
+        voltage:
+          name: Phase B Voltage
+    ct_clamps:
+      - { phase_id: phase_a, input: "A", power: { name: Mains A Power } }
+      - { phase_id: phase_b, input: "B", power: { name: Mains B Power } }
+      - { phase_id: phase_a, input: "1" }
+      - { phase_id: phase_b, input: "2" }
+      - phase_id: phase_a
+        input: "3"
+        power:
+          name: Kitchen Power
+          id: kitchen_power
+        current:
+          name: Kitchen Current
+        power_factor:
+          name: Kitchen Power Factor
+        apparent_power:
+          name: Kitchen Apparent Power
+      - { phase_id: phase_b, input: "4", reverse: true, key: garage, power: { name: Garage Power } }
+      - { phase_id: phase_a, input: "5", load_events: false, power: { name: Lights Power } }
+    circuits:
+      - inputs: ["1", "2"]
+        power:
+          name: Dryer Power
+        current:
+          name: Dryer Current
+        power_factor:
+          name: Dryer Power Factor
+    load_events:
+      min_step: 40W
+      timeout: 15s
+    on_load_event:
+      - mqtt.publish:
+          topic: vue-test/load_event
+          payload: !lambda return event.json();
+
+  - platform: total_daily_energy
+    name: Kitchen Daily Energy
+    power_id: kitchen_power
+
+time:
+  - platform: sntp
