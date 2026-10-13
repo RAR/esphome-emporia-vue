@@ -1,7 +1,9 @@
 #include "emporia_vue.h"
 
+#include <cstddef>
 #include <cstring>
 #include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
 namespace esphome {
@@ -73,6 +75,23 @@ void EmporiaVueComponent::update() {
   }
 
   if (sensor_reading.end != 0) {
+    // Debug: what the meter chip sent, every 10 s while its frames are malformed.
+    static uint32_t last_dump = 0;
+    if (millis() - last_dump > 10000) {
+      last_dump = millis();
+      const auto *raw = reinterpret_cast<const uint8_t *>(&sensor_reading);
+      size_t ff = 0, zero = 0;
+      for (size_t i = 0; i < sizeof(sensor_reading); i++) {
+        ff += raw[i] == 0xFF;
+        zero += raw[i] == 0x00;
+      }
+      ESP_LOGW(TAG, "Raw frame (%u bytes): %u are 0xFF, %u are 0x00", (unsigned) sizeof(sensor_reading),
+               (unsigned) ff, (unsigned) zero);
+      ESP_LOGW(TAG, "  first 32: %s", format_hex_pretty(raw, 32).c_str());
+      ESP_LOGW(TAG, "  middle 32 (voltages at %u): %s", (unsigned) offsetof(SensorReading, voltage),
+               format_hex_pretty(raw + offsetof(SensorReading, voltage), 32).c_str());
+      ESP_LOGW(TAG, "  last 16: %s", format_hex_pretty(raw + sizeof(sensor_reading) - 16, 16).c_str());
+    }
     ESP_LOGE(TAG, "Failed to read from sensor due to a malformed reading, should end in null bytes but is %d",
              sensor_reading.end);
     return;
